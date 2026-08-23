@@ -1,0 +1,91 @@
+{{/*
+    Fragments rendered both inside a full page and on their own as htmx
+    swap responses. They are defined once, here, and parsed into every page
+    set as well as the standalone fragment set — two copies of this markup
+    would drift the moment one was edited.
+*/}}
+
+{{/* item renders one row. Context is web.itemCtx: .Item and .Collection.
+     The row is its own hx-target, so every action on it swaps just itself. */}}
+{{define "item"}}
+<li class="item{{if .Item.Done}} done{{end}}" id="item-{{.Item.ID}}">
+  <label class="checkbox">
+    <input type="checkbox" {{if .Item.Done}}checked{{end}}
+           hx-post="/collections/{{.Collection.ID}}/items/{{.Item.ID}}/toggle"
+           hx-target="#item-{{.Item.ID}}"
+           hx-swap="outerHTML">
+    <span></span>
+  </label>
+  <div class="max">
+    <div class="item-title">{{.Item.Title}}</div>
+    {{if .Item.Body}}<div class="item-body small-text">{{.Item.Body}}</div>{{end}}
+    <div class="small-text secondary-text">added by {{.Item.CreatorEmail}}</div>
+  </div>
+  <button class="circle transparent"
+          hx-get="/collections/{{.Collection.ID}}/items/{{.Item.ID}}/edit"
+          hx-target="#item-{{.Item.ID}}"
+          hx-swap="outerHTML">
+    <i>edit</i>
+  </button>
+  <button class="circle transparent"
+          hx-delete="/collections/{{.Collection.ID}}/items/{{.Item.ID}}"
+          hx-target="#item-{{.Item.ID}}"
+          hx-swap="outerHTML"
+          hx-confirm="Delete this item?">
+    <i>delete</i>
+  </button>
+</li>
+{{end}}
+
+{{/* itemForm replaces a row in place while it is being edited. Cancel
+     re-fetches the row rather than restoring a client-side copy, so what
+     comes back is whatever is actually stored — including anyone else's
+     concurrent edit. */}}
+{{define "itemForm"}}
+<li class="item" id="item-{{.Item.ID}}">
+  <form class="max"
+        hx-put="/collections/{{.Collection.ID}}/items/{{.Item.ID}}"
+        hx-target="#item-{{.Item.ID}}"
+        hx-swap="outerHTML">
+    <div class="field label border">
+      <input type="text" name="title" value="{{.Item.Title}}" maxlength="200" required>
+      <label>Title</label>
+    </div>
+    <div class="field textarea label border">
+      <textarea name="body" maxlength="4000">{{.Item.Body}}</textarea>
+      <label>Notes</label>
+    </div>
+    <nav class="right-align">
+      <button type="button" class="transparent"
+              hx-get="/collections/{{.Collection.ID}}/items/{{.Item.ID}}"
+              hx-target="#item-{{.Item.ID}}"
+              hx-swap="outerHTML">Cancel</button>
+      <button type="submit">Save</button>
+    </nav>
+  </form>
+</li>
+{{end}}
+
+{{/* members is swapped wholesale after any membership change: the list is
+     short, and re-rendering it is simpler than reasoning about which row
+     moved. Context is web.pageData. */}}
+{{define "members"}}
+<ul class="list border" id="members">
+  {{range .Members}}
+  <li>
+    <div class="max">{{.Email}}</div>
+    {{if eq .ID $.Collection.OwnerID}}
+      <span class="chip small">owner</span>
+    {{else if $.IsOwner}}
+      <button class="circle transparent"
+              hx-delete="/collections/{{$.Collection.ID}}/members/{{.ID}}"
+              hx-target="#members"
+              hx-swap="outerHTML"
+              hx-confirm="Remove {{.Email}} from this collection?">
+        <i>person_remove</i>
+      </button>
+    {{end}}
+  </li>
+  {{end}}
+</ul>
+{{end}}

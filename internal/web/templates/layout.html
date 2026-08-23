@@ -1,0 +1,82 @@
+{{/*
+    layout is the page shell. Every page template defines "content" (the
+    body) and "title" (the <title> text) and executes "layout" against its
+    data; this file only ever references those two names, never defines
+    them, so a page can't accidentally shadow another page's content.
+
+    Data contract: a struct with at least .UserEmail and .Title.
+*/}}
+{{define "layout"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Beer CSS's own JS toggles the "dark" class from
+       prefers-color-scheme (see beer.min.js), but this still tells the
+       browser chrome itself (scrollbars, form controls) which palettes are
+       supported, so nothing flashes light-on-light before the script runs. -->
+  <meta name="color-scheme" content="light dark">
+  <title>{{template "title" .}}</title>
+
+  <!-- Everything this page needs is vendored and embedded in the binary —
+       see internal/assets. No CDN, no Google Fonts: this is a private app
+       behind auth, and an external font or script request would hand every
+       viewer's IP to a third party on every page load. -->
+  <link rel="stylesheet" href="/static/beer.min.css">
+  <script type="module" src="/static/beer.min.js"></script>
+  <script src="/static/htmx.min.js"></script>
+
+  <style>
+    /* Only what Beer CSS doesn't already give us for this app's lists.
+       Everything else — colour, elevation, ripples — is Beer's job;
+       duplicating it here would fight the theme instead of using it. */
+
+    /* Beer's <ul class="list"> rows have no vertical breathing room by
+       default, which reads fine for a menu but cramped for a row that
+       carries a title and a body line. */
+    .list.collections > li,
+    .list.items > li {
+      padding-block: 0.75rem;
+    }
+
+    /* A completed item stays in place rather than disappearing, so
+       undoing a mistake doesn't mean hunting for the item again — it
+       just looks done. */
+    .item.done .item-title {
+      text-decoration: line-through;
+      opacity: 0.6;
+    }
+
+    .item.done .item-body {
+      opacity: 0.5;
+    }
+
+    .item-title {
+      font-weight: 500;
+    }
+
+    /* Item bodies are free text a user typed, not UI copy — they can be
+       arbitrarily long with no natural break point (a pasted URL, a run
+       of digits). Without this they push the row wider than the card and
+       force horizontal scroll on a page with no other reason to have any. */
+    .item-body {
+      overflow-wrap: break-word;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="top">
+      <h5 class="max">list</h5>
+      <span>{{.UserEmail}}</span>
+    </nav>
+  </header>
+
+  <main class="responsive">
+    {{template "content" .}}
+  </main>
+</body>
+</html>
+{{end}}

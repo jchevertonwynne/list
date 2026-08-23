@@ -1,0 +1,79 @@
+{{define "title"}}{{.Collection.Name}}{{end}}
+
+{{define "content"}}
+<nav>
+  <a href="/" class="button circle transparent"><i>arrow_back</i></a>
+  <h5 class="max">{{.Collection.Name}}</h5>
+</nav>
+
+<article class="border round">
+  <form hx-post="/collections/{{.Collection.ID}}/items"
+        hx-target="#items"
+        hx-swap="beforeend"
+        hx-on::after-request="if(event.detail.successful) this.reset()">
+    <div class="field label border">
+      <input type="text" name="title" maxlength="200" required autocomplete="off">
+      <label>New item</label>
+    </div>
+    <div class="field textarea label border">
+      <textarea name="body" maxlength="4000"></textarea>
+      <label>Notes (optional)</label>
+    </div>
+    <nav class="right-align">
+      <button type="submit"><i>add</i> Add</button>
+    </nav>
+  </form>
+  <div id="item-error" class="error-text small-text"></div>
+</article>
+
+<ul class="list items border" id="items">
+  {{$c := .Collection}}
+  {{range .Items}}
+    {{template "item" (itemCtx .  $c)}}
+  {{end}}
+</ul>
+
+<h6>People</h6>
+{{template "members" .}}
+
+{{if .IsOwner}}
+<article class="border round">
+  <form hx-post="/collections/{{.Collection.ID}}/members"
+        hx-target="#members"
+        hx-swap="outerHTML"
+        hx-on::after-request="if(event.detail.successful) this.reset()">
+    <nav>
+      <div class="field label border max">
+        <input type="email" name="email" maxlength="320" required autocomplete="off">
+        <label>Invite by email</label>
+      </div>
+      <button type="submit"><i>person_add</i></button>
+    </nav>
+  </form>
+  <p class="small-text secondary-text">
+    They also need adding to this hostname's Cloudflare Access policy before
+    they can sign in. Until then the invite simply waits.
+  </p>
+</article>
+
+<details class="border round">
+  <summary class="bold">Collection settings</summary>
+  <form hx-post="/collections/{{.Collection.ID}}/rename">
+    <nav>
+      <div class="field label border max">
+        <input type="text" name="name" value="{{.Collection.Name}}" maxlength="200" required>
+        <label>Rename</label>
+      </div>
+      <button type="submit">Save</button>
+    </nav>
+  </form>
+  <nav class="right-align">
+    <button class="error"
+            hx-delete="/collections/{{.Collection.ID}}"
+            hx-confirm="Delete this collection and everything in it?">
+      <i>delete_forever</i> Delete collection
+    </button>
+  </nav>
+</details>
+{{end}}
+{{end}}

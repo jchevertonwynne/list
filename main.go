@@ -1,6 +1,10 @@
-// Command app is a starting point for a service on the k3s cluster described
-// in jchevertonwynne/homelab. Replace this comment and handleRoot with
-// whatever the app actually does; the rest is the shape the cluster expects.
+// Command list is a shared to-do list for the k3s cluster described in
+// jchevertonwynne/homelab, served at list.jchevertonwynne.uk.
+//
+// It has no login of its own. Cloudflare Access authenticates every request
+// at the edge and passes the address on in a header; see internal/web/auth.go
+// for why trusting that header is reasonable here and what it would take for
+// it to stop being reasonable.
 package main
 
 import (
@@ -12,19 +16,33 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"list/internal/store"
+	"list/internal/web"
 )
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
+	dbPath := flag.String("db", "/var/lib/list/list.db", "path to the SQLite database")
+	devUser := flag.String("dev-user", "", "email to assume when no Access header is present; local development only")
 	flag.Parse()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /{$}", handleRoot)
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		// A database that will not open is a startup failure, not something
+		// to serve 500s over: the pod should crashloop visibly rather than
+		// look healthy while nothing works.
+		log.Fatalf("opening %s: %v", *dbPath, err)
+	}
+	defer db.Close()
+
+	if *devUser != "" {
+		log.Printf("WARNING: -dev-user is set to %q; every unauthenticated request will be treated as that user", *devUser)
+	}
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: mux,
+		Handler: web.New(db, *devUser).Handler(),
 		// A service reachable from the internet needs these. Without
 		// ReadHeaderTimeout a single client can hold a connection open
 		// indefinitely by dribbling out headers.
@@ -35,13 +53,13 @@ func main() {
 	}
 
 	// Kubernetes sends SIGTERM and waits terminationGracePeriodSeconds before
-	// SIGKILL. Anything that must be flushed on the way out goes after
-	// Shutdown returns.
+	// SIGKILL. SQLite is committed by the time a request returns, so there is
+	// nothing to flush here beyond letting in-flight requests finish.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		log.Printf("listening on %s", *addr)
+		log.Printf("listening on %s, database at %s", *addr, *dbPath)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
@@ -54,19 +72,4 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
-}
-
-// handleHealthz is what the readiness and liveness probes hit. Keep it cheap
-// and keep it free of dependencies: it runs several times a minute forever, so
-// anything expensive here is expensive permanently, and a failing database
-// should surface as a 500 on a real request rather than as a restart loop.
-func handleHealthz(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Write([]byte("ok\n"))
-}
-
-func handleRoot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte("hello\n"))
 }

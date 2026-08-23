@@ -1,0 +1,39 @@
+{{define "title"}}list{{end}}
+
+{{define "content"}}
+<h5>Your collections</h5>
+
+<article class="border round">
+  <form hx-post="/collections" hx-target="#create-error" hx-swap="innerHTML">
+    <nav>
+      <div class="field label border max">
+        <input type="text" name="name" maxlength="200" required autocomplete="off">
+        <label>New collection</label>
+      </div>
+      <button type="submit"><i>add</i></button>
+    </nav>
+  </form>
+  <div id="create-error" class="error-text small-text"></div>
+</article>
+
+{{if .Collections}}
+<ul class="list collections border">
+  {{range .Collections}}
+  <li>
+    <div class="max">
+      <a href="/collections/{{.ID}}" class="bold">{{.Name}}</a>
+      <div class="small-text secondary-text">
+        {{.DoneCount}} of {{.ItemCount}} done &middot; owned by {{.OwnerEmail}}
+      </div>
+    </div>
+    <progress class="circle" value="{{.DoneCount}}" max="{{if .ItemCount}}{{.ItemCount}}{{else}}1{{end}}"></progress>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<article class="border round center-align">
+  <i class="extra">checklist</i>
+  <p class="secondary-text">Nothing here yet. Make a collection above.</p>
+</article>
+{{end}}
+{{end}}

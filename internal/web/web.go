@@ -1,0 +1,84 @@
+// Package web is the HTTP surface: routing, authorisation and rendering.
+//
+// It depends on the store through an interface rather than a concrete type so
+// that handlers can be tested against a fake without opening a database.
+package web
+
+import (
+	"context"
+	"net/http"
+
+	"list/internal/store"
+)
+
+// Store is everything the HTTP layer needs from persistence.
+type Store interface {
+	// UserByEmail upserts: an email that has never been seen becomes a user.
+	// Both authentication and invitation rely on that.
+	UserByEmail(ctx context.Context, email string) (store.User, error)
+
+	CollectionsForUser(ctx context.Context, userID int64) ([]store.CollectionView, error)
+	CreateCollection(ctx context.Context, ownerID int64, name string) (store.Collection, error)
+	Collection(ctx context.Context, id int64) (store.Collection, error)
+	IsMember(ctx context.Context, collectionID, userID int64) (bool, error)
+	RenameCollection(ctx context.Context, id int64, name string) error
+	DeleteCollection(ctx context.Context, id int64) error
+
+	Items(ctx context.Context, collectionID int64) ([]store.ItemView, error)
+	CreateItem(ctx context.Context, collectionID, creatorID int64, title, body string) (store.ItemView, error)
+	Item(ctx context.Context, id int64) (store.ItemView, error)
+	UpdateItem(ctx context.Context, id int64, title, body string) (store.ItemView, error)
+	ToggleItem(ctx context.Context, id int64) (store.ItemView, error)
+	DeleteItem(ctx context.Context, id int64) error
+
+	Members(ctx context.Context, collectionID int64) ([]store.User, error)
+	AddMember(ctx context.Context, collectionID int64, email string) (store.User, error)
+	RemoveMember(ctx context.Context, collectionID, userID int64) error
+}
+
+// Server holds the dependencies every handler needs.
+type Server struct {
+	store Store
+	// devUser stands in for the Access header when running locally, where
+	// there is no Access in front of anything. Empty in production, and an
+	// empty devUser with no header is a rejected request, never an anonymous
+	// one.
+	devUser string
+}
+
+func New(s Store, devUser string) *Server {
+	return &Server{store: s, devUser: devUser}
+}
+
+// Handler builds the mux. Everything except /healthz and /static/ sits behind
+// authentication.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	// Unauthenticated: the probes must not depend on Access, and the assets
+	// are the same for everyone.
+	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.Handle("GET /static/", staticHandler())
+
+	// Authenticated application routes are registered on their own mux so a
+	// single wrapper covers all of them — a route added later cannot forget
+	// to authenticate.
+	app := http.NewServeMux()
+	s.routes(app)
+
+	// authenticate outermost so that every response — including one the CSRF
+	// guard rejects — carries Cache-Control: no-store, and so that the guard's
+	// log lines can name the user they came from.
+	mux.Handle("/", s.authenticate(guardCSRF(app)))
+	return mux
+}
+
+// handleHealthz is what the readiness and liveness probes hit. Cheap and
+// dependency-free on purpose: it runs several times a minute forever, and a
+// broken database should surface as a 500 on a real request rather than as a
+// restart loop.
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte("ok\n"))
+}

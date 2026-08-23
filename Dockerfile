@@ -1,8 +1,10 @@
 FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
-# Copy go.mod first so the download layer caches across source edits. If the
-# app gains dependencies, add go.sum here too.
-COPY go.mod ./
+# Copy the module files first and download separately, so the dependency layer
+# is cached across source edits. modernc.org/sqlite is a large pure-Go tree and
+# re-fetching it on every source change makes each build minutes slower.
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
