@@ -6,7 +6,7 @@ COPY go.mod ./
 COPY . .
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/app .
+    go build -trimpath -ldflags="-s -w" -o /out/list .
 
 # scratch: a static binary needs nothing else. No shell, no libc, nothing to
 # patch. If the app makes outbound HTTPS calls it needs CA certificates —
@@ -16,6 +16,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
 # main.go and set TZ in the deployment. A scratch image has no zone database
 # and Go falls back to UTC without complaining.
 FROM scratch
-COPY --from=build /out/app /app
+COPY --from=build /out/list /list
 USER 65532:65532
-ENTRYPOINT ["/app"]
+ENTRYPOINT ["/list"]
+
+CMD ["-addr", ":8094"]
