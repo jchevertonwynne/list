@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"list/internal/store"
+	"list/internal/tracing"
 	"list/internal/web"
 )
 
@@ -25,7 +26,13 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	dbPath := flag.String("db", "/var/lib/list/list.db", "path to the SQLite database")
 	devUser := flag.String("dev-user", "", "email to assume when no Access header is present; local development only")
+	otelEndpoint := flag.String("otel-endpoint", "", "host:port of an OTLP/gRPC trace collector; tracing is disabled if empty")
 	flag.Parse()
+
+	shutdownTracing, err := tracing.Init(context.Background(), "list", *otelEndpoint)
+	if err != nil {
+		log.Fatalf("init tracing: %v", err)
+	}
 
 	db, err := store.Open(*dbPath)
 	if err != nil {
@@ -71,5 +78,8 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
+	}
+	if err := shutdownTracing(shutdownCtx); err != nil {
+		log.Printf("tracing shutdown: %v", err)
 	}
 }

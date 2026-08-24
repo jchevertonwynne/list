@@ -10,6 +10,7 @@ import (
 
 	"list/internal/metrics"
 	"list/internal/store"
+	"list/internal/tracing"
 )
 
 // Store is everything the HTTP layer needs from persistence.
@@ -76,8 +77,9 @@ func (s *Server) Handler() http.Handler {
 
 	// Instrument wraps the whole mux, not just app: /healthz and /metrics
 	// scrapes are frequent enough that leaving them out would undercount
-	// request volume relative to what's actually hitting the pod.
-	return metrics.Instrument(mux)
+	// request volume relative to what's actually hitting the pod. tracing
+	// wraps outermost so the span covers metrics recording and auth too.
+	return tracing.Middleware("list", metrics.Instrument(mux))
 }
 
 // handleHealthz is what the readiness and liveness probes hit. Cheap and
