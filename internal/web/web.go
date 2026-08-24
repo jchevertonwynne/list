@@ -8,6 +8,7 @@ import (
 	"context"
 	"net/http"
 
+	"list/internal/metrics"
 	"list/internal/store"
 )
 
@@ -50,15 +51,17 @@ func New(s Store, devUser string) *Server {
 	return &Server{store: s, devUser: devUser}
 }
 
-// Handler builds the mux. Everything except /healthz and /static/ sits behind
-// authentication.
+// Handler builds the mux. Everything except /healthz, /static/ and /metrics
+// sits behind authentication.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Unauthenticated: the probes must not depend on Access, and the assets
-	// are the same for everyone.
+	// Unauthenticated: the probes must not depend on Access, the assets are
+	// the same for everyone, and Alloy scraping /metrics has no Access
+	// session to present.
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.Handle("GET /static/", staticHandler())
+	mux.Handle("GET /metrics", metrics.Handler())
 
 	// Authenticated application routes are registered on their own mux so a
 	// single wrapper covers all of them — a route added later cannot forget
@@ -70,7 +73,11 @@ func (s *Server) Handler() http.Handler {
 	// guard rejects — carries Cache-Control: no-store, and so that the guard's
 	// log lines can name the user they came from.
 	mux.Handle("/", s.authenticate(guardCSRF(app)))
-	return mux
+
+	// Instrument wraps the whole mux, not just app: /healthz and /metrics
+	// scrapes are frequent enough that leaving them out would undercount
+	// request volume relative to what's actually hitting the pod.
+	return metrics.Instrument(mux)
 }
 
 // handleHealthz is what the readiness and liveness probes hit. Cheap and
