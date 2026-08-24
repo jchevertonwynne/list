@@ -173,27 +173,29 @@ func notFoundIfNoRows(res sql.Result, format string, args ...any) error {
 // invitation (naming someone before they have ever logged in) depend on this
 // never returning ErrNotFound.
 func (d *DB) UserByEmail(ctx context.Context, email string) (User, error) {
-	email = normaliseEmail(email)
-	now := time.Now().Unix()
+	return withSpan(ctx, "UserByEmail", func(ctx context.Context) (User, error) {
+		email = normaliseEmail(email)
+		now := time.Now().Unix()
 
-	if _, err := d.db.ExecContext(ctx, `
-		INSERT INTO users (email, created_at) VALUES (?, ?)
-		ON CONFLICT (email) DO NOTHING
-	`, email, now); err != nil {
-		return User{}, fmt.Errorf("upsert user %s: %w", email, err)
-	}
+		if _, err := d.db.ExecContext(ctx, `
+			INSERT INTO users (email, created_at) VALUES (?, ?)
+			ON CONFLICT (email) DO NOTHING
+		`, email, now); err != nil {
+			return User{}, fmt.Errorf("upsert user %s: %w", email, err)
+		}
 
-	var u User
-	var createdAt int64
-	err := d.db.QueryRowContext(ctx, `SELECT id, email, created_at FROM users WHERE email = ?`, email).
-		Scan(&u.ID, &u.Email, &createdAt)
-	if err != nil {
-		// Not mapped to ErrNotFound: the row was just inserted or already
-		// existed, so its absence here means something else went wrong.
-		return User{}, fmt.Errorf("load user %s: %w", email, err)
-	}
-	u.CreatedAt = time.Unix(createdAt, 0).UTC()
-	return u, nil
+		var u User
+		var createdAt int64
+		err := d.db.QueryRowContext(ctx, `SELECT id, email, created_at FROM users WHERE email = ?`, email).
+			Scan(&u.ID, &u.Email, &createdAt)
+		if err != nil {
+			// Not mapped to ErrNotFound: the row was just inserted or already
+			// existed, so its absence here means something else went wrong.
+			return User{}, fmt.Errorf("load user %s: %w", email, err)
+		}
+		u.CreatedAt = time.Unix(createdAt, 0).UTC()
+		return u, nil
+	})
 }
 
 // CollectionsForUser returns collections the user is a member of, which
@@ -202,37 +204,39 @@ func (d *DB) UserByEmail(ctx context.Context, email string) (User, error) {
 // the handler so the index page is one query regardless of how many
 // collections or items exist.
 func (d *DB) CollectionsForUser(ctx context.Context, userID int64) ([]CollectionView, error) {
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT c.id, c.name, c.owner_id, c.created_at, o.email,
-		       COUNT(i.id) AS item_count,
-		       COALESCE(SUM(i.done), 0) AS done_count
-		FROM memberships m
-		JOIN collections c ON c.id = m.collection_id
-		JOIN users o ON o.id = c.owner_id
-		LEFT JOIN items i ON i.collection_id = c.id
-		WHERE m.user_id = ?
-		GROUP BY c.id
-		ORDER BY c.created_at DESC
-	`, userID)
-	if err != nil {
-		return nil, fmt.Errorf("list collections for user %d: %w", userID, err)
-	}
-	defer rows.Close()
-
-	var views []CollectionView
-	for rows.Next() {
-		var v CollectionView
-		var createdAt int64
-		if err := rows.Scan(&v.ID, &v.Name, &v.OwnerID, &createdAt, &v.OwnerEmail, &v.ItemCount, &v.DoneCount); err != nil {
-			return nil, fmt.Errorf("scan collection: %w", err)
+	return withSpan(ctx, "CollectionsForUser", func(ctx context.Context) ([]CollectionView, error) {
+		rows, err := d.db.QueryContext(ctx, `
+			SELECT c.id, c.name, c.owner_id, c.created_at, o.email,
+			       COUNT(i.id) AS item_count,
+			       COALESCE(SUM(i.done), 0) AS done_count
+			FROM memberships m
+			JOIN collections c ON c.id = m.collection_id
+			JOIN users o ON o.id = c.owner_id
+			LEFT JOIN items i ON i.collection_id = c.id
+			WHERE m.user_id = ?
+			GROUP BY c.id
+			ORDER BY c.created_at DESC
+		`, userID)
+		if err != nil {
+			return nil, fmt.Errorf("list collections for user %d: %w", userID, err)
 		}
-		v.CreatedAt = time.Unix(createdAt, 0).UTC()
-		views = append(views, v)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list collections for user %d: %w", userID, err)
-	}
-	return views, nil
+		defer rows.Close()
+
+		var views []CollectionView
+		for rows.Next() {
+			var v CollectionView
+			var createdAt int64
+			if err := rows.Scan(&v.ID, &v.Name, &v.OwnerID, &createdAt, &v.OwnerEmail, &v.ItemCount, &v.DoneCount); err != nil {
+				return nil, fmt.Errorf("scan collection: %w", err)
+			}
+			v.CreatedAt = time.Unix(createdAt, 0).UTC()
+			views = append(views, v)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("list collections for user %d: %w", userID, err)
+		}
+		return views, nil
+	})
 }
 
 // CreateCollection inserts the collection and the owner's membership row in
@@ -240,48 +244,52 @@ func (d *DB) CollectionsForUser(ctx context.Context, userID int64) ([]Collection
 // crash or a concurrent read between the two inserts would show the owner a
 // collection list that does not include the collection they just made.
 func (d *DB) CreateCollection(ctx context.Context, ownerID int64, name string) (Collection, error) {
-	now := time.Now().Unix()
+	return withSpan(ctx, "CreateCollection", func(ctx context.Context) (Collection, error) {
+		now := time.Now().Unix()
 
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Collection{}, fmt.Errorf("begin create collection: %w", err)
-	}
-	defer tx.Rollback()
+		tx, err := d.db.BeginTx(ctx, nil)
+		if err != nil {
+			return Collection{}, fmt.Errorf("begin create collection: %w", err)
+		}
+		defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx, `INSERT INTO collections (name, owner_id, created_at) VALUES (?, ?, ?)`, name, ownerID, now)
-	if err != nil {
-		return Collection{}, fmt.Errorf("insert collection: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return Collection{}, fmt.Errorf("collection id: %w", err)
-	}
+		res, err := tx.ExecContext(ctx, `INSERT INTO collections (name, owner_id, created_at) VALUES (?, ?, ?)`, name, ownerID, now)
+		if err != nil {
+			return Collection{}, fmt.Errorf("insert collection: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return Collection{}, fmt.Errorf("collection id: %w", err)
+		}
 
-	if _, err := tx.ExecContext(ctx, `INSERT INTO memberships (collection_id, user_id, created_at) VALUES (?, ?, ?)`, id, ownerID, now); err != nil {
-		return Collection{}, fmt.Errorf("insert owner membership: %w", err)
-	}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO memberships (collection_id, user_id, created_at) VALUES (?, ?, ?)`, id, ownerID, now); err != nil {
+			return Collection{}, fmt.Errorf("insert owner membership: %w", err)
+		}
 
-	if err := tx.Commit(); err != nil {
-		return Collection{}, fmt.Errorf("commit create collection: %w", err)
-	}
+		if err := tx.Commit(); err != nil {
+			return Collection{}, fmt.Errorf("commit create collection: %w", err)
+		}
 
-	return Collection{ID: id, Name: name, OwnerID: ownerID, CreatedAt: time.Unix(now, 0).UTC()}, nil
+		return Collection{ID: id, Name: name, OwnerID: ownerID, CreatedAt: time.Unix(now, 0).UTC()}, nil
+	})
 }
 
 // Collection loads a single collection by id.
 func (d *DB) Collection(ctx context.Context, id int64) (Collection, error) {
-	var c Collection
-	var createdAt int64
-	err := d.db.QueryRowContext(ctx, `SELECT id, name, owner_id, created_at FROM collections WHERE id = ?`, id).
-		Scan(&c.ID, &c.Name, &c.OwnerID, &createdAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Collection{}, fmt.Errorf("collection %d: %w", id, ErrNotFound)
-	}
-	if err != nil {
-		return Collection{}, fmt.Errorf("load collection %d: %w", id, err)
-	}
-	c.CreatedAt = time.Unix(createdAt, 0).UTC()
-	return c, nil
+	return withSpan(ctx, "Collection", func(ctx context.Context) (Collection, error) {
+		var c Collection
+		var createdAt int64
+		err := d.db.QueryRowContext(ctx, `SELECT id, name, owner_id, created_at FROM collections WHERE id = ?`, id).
+			Scan(&c.ID, &c.Name, &c.OwnerID, &createdAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Collection{}, fmt.Errorf("collection %d: %w", id, ErrNotFound)
+		}
+		if err != nil {
+			return Collection{}, fmt.Errorf("load collection %d: %w", id, err)
+		}
+		c.CreatedAt = time.Unix(createdAt, 0).UTC()
+		return c, nil
+	})
 }
 
 // IsMember reports whether userID may see collectionID. A row's absence is
@@ -289,172 +297,192 @@ func (d *DB) Collection(ctx context.Context, id int64) (Collection, error) {
 // so returning ErrNotFound from inside the check it is deciding would be
 // circular.
 func (d *DB) IsMember(ctx context.Context, collectionID, userID int64) (bool, error) {
-	var exists int
-	err := d.db.QueryRowContext(ctx, `SELECT 1 FROM memberships WHERE collection_id = ? AND user_id = ?`, collectionID, userID).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("check membership of %d in collection %d: %w", userID, collectionID, err)
-	}
-	return true, nil
+	return withSpan(ctx, "IsMember", func(ctx context.Context) (bool, error) {
+		var exists int
+		err := d.db.QueryRowContext(ctx, `SELECT 1 FROM memberships WHERE collection_id = ? AND user_id = ?`, collectionID, userID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("check membership of %d in collection %d: %w", userID, collectionID, err)
+		}
+		return true, nil
+	})
 }
 
 // RenameCollection updates the display name.
 func (d *DB) RenameCollection(ctx context.Context, id int64, name string) error {
-	res, err := d.db.ExecContext(ctx, `UPDATE collections SET name = ? WHERE id = ?`, name, id)
-	if err != nil {
-		return fmt.Errorf("rename collection %d: %w", id, err)
-	}
-	return notFoundIfNoRows(res, "collection %d", id)
+	return withSpanErr(ctx, "RenameCollection", func(ctx context.Context) error {
+		res, err := d.db.ExecContext(ctx, `UPDATE collections SET name = ? WHERE id = ?`, name, id)
+		if err != nil {
+			return fmt.Errorf("rename collection %d: %w", id, err)
+		}
+		return notFoundIfNoRows(res, "collection %d", id)
+	})
 }
 
 // DeleteCollection removes the collection. Its memberships and items go with
 // it via ON DELETE CASCADE — see the foreign_keys(1) pragma in Open for why
 // that cascade is trustworthy at all.
 func (d *DB) DeleteCollection(ctx context.Context, id int64) error {
-	res, err := d.db.ExecContext(ctx, `DELETE FROM collections WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete collection %d: %w", id, err)
-	}
-	return notFoundIfNoRows(res, "collection %d", id)
+	return withSpanErr(ctx, "DeleteCollection", func(ctx context.Context) error {
+		res, err := d.db.ExecContext(ctx, `DELETE FROM collections WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete collection %d: %w", id, err)
+		}
+		return notFoundIfNoRows(res, "collection %d", id)
+	})
 }
 
 // Items lists a collection's items with the creator's email resolved by
 // join, so rendering a list of N items costs one query rather than N+1.
 func (d *DB) Items(ctx context.Context, collectionID int64) ([]ItemView, error) {
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT i.id, i.collection_id, i.title, i.body, i.done, i.creator_id, i.created_at, i.updated_at, u.email
-		FROM items i
-		JOIN users u ON u.id = i.creator_id
-		WHERE i.collection_id = ?
-		ORDER BY i.id
-	`, collectionID)
-	if err != nil {
-		return nil, fmt.Errorf("list items for collection %d: %w", collectionID, err)
-	}
-	defer rows.Close()
-
-	var views []ItemView
-	for rows.Next() {
-		var v ItemView
-		var createdAt, updatedAt int64
-		if err := rows.Scan(&v.ID, &v.CollectionID, &v.Title, &v.Body, &v.Done, &v.CreatorID, &createdAt, &updatedAt, &v.CreatorEmail); err != nil {
-			return nil, fmt.Errorf("scan item: %w", err)
+	return withSpan(ctx, "Items", func(ctx context.Context) ([]ItemView, error) {
+		rows, err := d.db.QueryContext(ctx, `
+			SELECT i.id, i.collection_id, i.title, i.body, i.done, i.creator_id, i.created_at, i.updated_at, u.email
+			FROM items i
+			JOIN users u ON u.id = i.creator_id
+			WHERE i.collection_id = ?
+			ORDER BY i.id
+		`, collectionID)
+		if err != nil {
+			return nil, fmt.Errorf("list items for collection %d: %w", collectionID, err)
 		}
-		v.CreatedAt = time.Unix(createdAt, 0).UTC()
-		v.UpdatedAt = time.Unix(updatedAt, 0).UTC()
-		views = append(views, v)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list items for collection %d: %w", collectionID, err)
-	}
-	return views, nil
+		defer rows.Close()
+
+		var views []ItemView
+		for rows.Next() {
+			var v ItemView
+			var createdAt, updatedAt int64
+			if err := rows.Scan(&v.ID, &v.CollectionID, &v.Title, &v.Body, &v.Done, &v.CreatorID, &createdAt, &updatedAt, &v.CreatorEmail); err != nil {
+				return nil, fmt.Errorf("scan item: %w", err)
+			}
+			v.CreatedAt = time.Unix(createdAt, 0).UTC()
+			v.UpdatedAt = time.Unix(updatedAt, 0).UTC()
+			views = append(views, v)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("list items for collection %d: %w", collectionID, err)
+		}
+		return views, nil
+	})
 }
 
 // CreateItem inserts a new item and re-reads it through Item so the caller
 // gets the creator's email back without duplicating that join here.
 func (d *DB) CreateItem(ctx context.Context, collectionID, creatorID int64, title, body string) (ItemView, error) {
-	now := time.Now().Unix()
-	res, err := d.db.ExecContext(ctx, `
-		INSERT INTO items (collection_id, title, body, creator_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, collectionID, title, body, creatorID, now, now)
-	if err != nil {
-		return ItemView{}, fmt.Errorf("insert item: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return ItemView{}, fmt.Errorf("item id: %w", err)
-	}
-	return d.Item(ctx, id)
+	return withSpan(ctx, "CreateItem", func(ctx context.Context) (ItemView, error) {
+		now := time.Now().Unix()
+		res, err := d.db.ExecContext(ctx, `
+			INSERT INTO items (collection_id, title, body, creator_id, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, collectionID, title, body, creatorID, now, now)
+		if err != nil {
+			return ItemView{}, fmt.Errorf("insert item: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return ItemView{}, fmt.Errorf("item id: %w", err)
+		}
+		return d.Item(ctx, id)
+	})
 }
 
 // Item loads a single item with its creator's email resolved.
 func (d *DB) Item(ctx context.Context, id int64) (ItemView, error) {
-	var v ItemView
-	var createdAt, updatedAt int64
-	err := d.db.QueryRowContext(ctx, `
-		SELECT i.id, i.collection_id, i.title, i.body, i.done, i.creator_id, i.created_at, i.updated_at, u.email
-		FROM items i
-		JOIN users u ON u.id = i.creator_id
-		WHERE i.id = ?
-	`, id).Scan(&v.ID, &v.CollectionID, &v.Title, &v.Body, &v.Done, &v.CreatorID, &createdAt, &updatedAt, &v.CreatorEmail)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ItemView{}, fmt.Errorf("item %d: %w", id, ErrNotFound)
-	}
-	if err != nil {
-		return ItemView{}, fmt.Errorf("load item %d: %w", id, err)
-	}
-	v.CreatedAt = time.Unix(createdAt, 0).UTC()
-	v.UpdatedAt = time.Unix(updatedAt, 0).UTC()
-	return v, nil
+	return withSpan(ctx, "Item", func(ctx context.Context) (ItemView, error) {
+		var v ItemView
+		var createdAt, updatedAt int64
+		err := d.db.QueryRowContext(ctx, `
+			SELECT i.id, i.collection_id, i.title, i.body, i.done, i.creator_id, i.created_at, i.updated_at, u.email
+			FROM items i
+			JOIN users u ON u.id = i.creator_id
+			WHERE i.id = ?
+		`, id).Scan(&v.ID, &v.CollectionID, &v.Title, &v.Body, &v.Done, &v.CreatorID, &createdAt, &updatedAt, &v.CreatorEmail)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ItemView{}, fmt.Errorf("item %d: %w", id, ErrNotFound)
+		}
+		if err != nil {
+			return ItemView{}, fmt.Errorf("load item %d: %w", id, err)
+		}
+		v.CreatedAt = time.Unix(createdAt, 0).UTC()
+		v.UpdatedAt = time.Unix(updatedAt, 0).UTC()
+		return v, nil
+	})
 }
 
 // UpdateItem changes title and body. Any member may call this — see the
 // comment on Item.CreatorID in types.go — so there is no creator check here.
 func (d *DB) UpdateItem(ctx context.Context, id int64, title, body string) (ItemView, error) {
-	res, err := d.db.ExecContext(ctx, `UPDATE items SET title = ?, body = ?, updated_at = ? WHERE id = ?`, title, body, time.Now().Unix(), id)
-	if err != nil {
-		return ItemView{}, fmt.Errorf("update item %d: %w", id, err)
-	}
-	if err := notFoundIfNoRows(res, "item %d", id); err != nil {
-		return ItemView{}, err
-	}
-	return d.Item(ctx, id)
+	return withSpan(ctx, "UpdateItem", func(ctx context.Context) (ItemView, error) {
+		res, err := d.db.ExecContext(ctx, `UPDATE items SET title = ?, body = ?, updated_at = ? WHERE id = ?`, title, body, time.Now().Unix(), id)
+		if err != nil {
+			return ItemView{}, fmt.Errorf("update item %d: %w", id, err)
+		}
+		if err := notFoundIfNoRows(res, "item %d", id); err != nil {
+			return ItemView{}, err
+		}
+		return d.Item(ctx, id)
+	})
 }
 
 // ToggleItem flips done. NOT done reads as a boolean flip in SQLite because
 // the column is INTEGER NOT NULL DEFAULT 0, so it is always exactly 0 or 1
 // going in.
 func (d *DB) ToggleItem(ctx context.Context, id int64) (ItemView, error) {
-	res, err := d.db.ExecContext(ctx, `UPDATE items SET done = NOT done, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
-	if err != nil {
-		return ItemView{}, fmt.Errorf("toggle item %d: %w", id, err)
-	}
-	if err := notFoundIfNoRows(res, "item %d", id); err != nil {
-		return ItemView{}, err
-	}
-	return d.Item(ctx, id)
+	return withSpan(ctx, "ToggleItem", func(ctx context.Context) (ItemView, error) {
+		res, err := d.db.ExecContext(ctx, `UPDATE items SET done = NOT done, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
+		if err != nil {
+			return ItemView{}, fmt.Errorf("toggle item %d: %w", id, err)
+		}
+		if err := notFoundIfNoRows(res, "item %d", id); err != nil {
+			return ItemView{}, err
+		}
+		return d.Item(ctx, id)
+	})
 }
 
 // DeleteItem removes one item.
 func (d *DB) DeleteItem(ctx context.Context, id int64) error {
-	res, err := d.db.ExecContext(ctx, `DELETE FROM items WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete item %d: %w", id, err)
-	}
-	return notFoundIfNoRows(res, "item %d", id)
+	return withSpanErr(ctx, "DeleteItem", func(ctx context.Context) error {
+		res, err := d.db.ExecContext(ctx, `DELETE FROM items WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete item %d: %w", id, err)
+		}
+		return notFoundIfNoRows(res, "item %d", id)
+	})
 }
 
 // Members lists everyone who can see a collection, owner included.
 func (d *DB) Members(ctx context.Context, collectionID int64) ([]User, error) {
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT u.id, u.email, u.created_at
-		FROM memberships m
-		JOIN users u ON u.id = m.user_id
-		WHERE m.collection_id = ?
-		ORDER BY u.email
-	`, collectionID)
-	if err != nil {
-		return nil, fmt.Errorf("list members of collection %d: %w", collectionID, err)
-	}
-	defer rows.Close()
-
-	var users []User
-	for rows.Next() {
-		var u User
-		var createdAt int64
-		if err := rows.Scan(&u.ID, &u.Email, &createdAt); err != nil {
-			return nil, fmt.Errorf("scan member: %w", err)
+	return withSpan(ctx, "Members", func(ctx context.Context) ([]User, error) {
+		rows, err := d.db.QueryContext(ctx, `
+			SELECT u.id, u.email, u.created_at
+			FROM memberships m
+			JOIN users u ON u.id = m.user_id
+			WHERE m.collection_id = ?
+			ORDER BY u.email
+		`, collectionID)
+		if err != nil {
+			return nil, fmt.Errorf("list members of collection %d: %w", collectionID, err)
 		}
-		u.CreatedAt = time.Unix(createdAt, 0).UTC()
-		users = append(users, u)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list members of collection %d: %w", collectionID, err)
-	}
-	return users, nil
+		defer rows.Close()
+
+		var users []User
+		for rows.Next() {
+			var u User
+			var createdAt int64
+			if err := rows.Scan(&u.ID, &u.Email, &createdAt); err != nil {
+				return nil, fmt.Errorf("scan member: %w", err)
+			}
+			u.CreatedAt = time.Unix(createdAt, 0).UTC()
+			users = append(users, u)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("list members of collection %d: %w", collectionID, err)
+		}
+		return users, nil
+	})
 }
 
 // AddMember invites someone by email, creating the user row if this is the
@@ -462,18 +490,20 @@ func (d *DB) Members(ctx context.Context, collectionID int64) ([]User, error) {
 // error: ON CONFLICT DO NOTHING means the caller does not have to check
 // membership first just to avoid a duplicate-key failure on a double click.
 func (d *DB) AddMember(ctx context.Context, collectionID int64, email string) (User, error) {
-	u, err := d.UserByEmail(ctx, email)
-	if err != nil {
-		return User{}, err
-	}
+	return withSpan(ctx, "AddMember", func(ctx context.Context) (User, error) {
+		u, err := d.UserByEmail(ctx, email)
+		if err != nil {
+			return User{}, err
+		}
 
-	if _, err := d.db.ExecContext(ctx, `
-		INSERT INTO memberships (collection_id, user_id, created_at) VALUES (?, ?, ?)
-		ON CONFLICT (collection_id, user_id) DO NOTHING
-	`, collectionID, u.ID, time.Now().Unix()); err != nil {
-		return User{}, fmt.Errorf("add member %s to collection %d: %w", u.Email, collectionID, err)
-	}
-	return u, nil
+		if _, err := d.db.ExecContext(ctx, `
+			INSERT INTO memberships (collection_id, user_id, created_at) VALUES (?, ?, ?)
+			ON CONFLICT (collection_id, user_id) DO NOTHING
+		`, collectionID, u.ID, time.Now().Unix()); err != nil {
+			return User{}, fmt.Errorf("add member %s to collection %d: %w", u.Email, collectionID, err)
+		}
+		return u, nil
+	})
 }
 
 // RemoveMember revokes access. It does not touch the owner_id on the
@@ -482,9 +512,11 @@ func (d *DB) AddMember(ctx context.Context, collectionID int64, email string) (U
 // cannot see it rather than deleting the collection — a deliberate gap
 // left for the web layer to decide whether to allow.
 func (d *DB) RemoveMember(ctx context.Context, collectionID, userID int64) error {
-	res, err := d.db.ExecContext(ctx, `DELETE FROM memberships WHERE collection_id = ? AND user_id = ?`, collectionID, userID)
-	if err != nil {
-		return fmt.Errorf("remove member %d from collection %d: %w", userID, collectionID, err)
-	}
-	return notFoundIfNoRows(res, "member %d of collection %d", userID, collectionID)
+	return withSpanErr(ctx, "RemoveMember", func(ctx context.Context) error {
+		res, err := d.db.ExecContext(ctx, `DELETE FROM memberships WHERE collection_id = ? AND user_id = ?`, collectionID, userID)
+		if err != nil {
+			return fmt.Errorf("remove member %d from collection %d: %w", userID, collectionID, err)
+		}
+		return notFoundIfNoRows(res, "member %d of collection %d", userID, collectionID)
+	})
 }
