@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"list/internal/profiling"
 	"list/internal/store"
 	"list/internal/tracing"
 	"list/internal/web"
@@ -27,7 +28,10 @@ func main() {
 	dbPath := flag.String("db", "/var/lib/list/list.db", "path to the SQLite database")
 	devUser := flag.String("dev-user", "", "email to assume when no Access header is present; local development only")
 	otelEndpoint := flag.String("otel-endpoint", "", "host:port of an OTLP/gRPC trace collector; tracing is disabled if empty")
+	pprofAddr := flag.String("pprof-addr", ":6060", "listen address for pprof debug endpoints; never expose this outside the cluster")
 	flag.Parse()
+
+	go profiling.ListenAndServe(*pprofAddr)
 
 	shutdownTracing, err := tracing.Init(context.Background(), "list", *otelEndpoint)
 	if err != nil {
