@@ -77,9 +77,13 @@ func (s *Server) Handler() http.Handler {
 
 	// Instrument wraps the whole mux, not just app: /healthz and /metrics
 	// scrapes are frequent enough that leaving them out would undercount
-	// request volume relative to what's actually hitting the pod. tracing
-	// wraps outermost so the span covers metrics recording and auth too.
-	return tracing.Middleware("list", metrics.Instrument(mux))
+	// request volume relative to what's actually hitting the pod. app is
+	// passed alongside it purely so Instrument can find the real matched
+	// pattern for authenticated routes — mux itself only sees them behind
+	// the "/" catch-all it hands off to s.authenticate(guardCSRF(app)).
+	// tracing wraps outermost so the span covers metrics recording and
+	// auth too.
+	return tracing.Middleware("list", metrics.Instrument(mux, app))
 }
 
 // handleHealthz is what the readiness and liveness probes hit. Cheap and
