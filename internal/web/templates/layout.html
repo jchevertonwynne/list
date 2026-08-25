@@ -236,12 +236,84 @@
        would still make the banner as tall as it is wide, shoving everything
        below it down the page. object-fit:cover crops to fill that shape
        rather than squashing the image to fit it. */
-    .cover-banner {
-      display: block;
-      inline-size: 100%;
-      aspect-ratio: 16 / 9;
-      object-fit: cover;
+    /* The collection page's cover band.
+
+       An uploaded photo is almost never the shape of a page-wide banner, so
+       the container fixes the shape and the photo is cropped to fill it —
+       the same bargain a Facebook cover photo makes. Note that no Beer
+       image helper class may be used on the image itself: Beer pins any
+       image carrying .round/.circle/.small/etc to a 3rem square, at a
+       specificity a single class here cannot beat. */
+    .cover {
+      position: relative;
+      border-radius: 0.75rem;
+      /* Clips the photo to the rounded corners, and contains the absolutely
+         positioned image below. */
+      overflow: hidden;
       margin-block-end: 1rem;
+    }
+
+    /* Only a collection that actually has a cover gets the band shape. The
+       same element is the plain title bar otherwise, at whatever height its
+       contents need. */
+    .cover.has-cover {
+      /* aspect-ratio resolves in whichever direction is left indefinite, so
+         this has to be pinned: with the inline axis free, min-block-size
+         below would force the height and the ratio would then derive a
+         *width* from it — 9rem x 3 = 27rem, wider than a phone's viewport,
+         clipped invisibly by Beer's own `main { overflow: hidden }`. That is
+         not hypothetical; it silently ate the remove-cover button. Pinning
+         the inline axis leaves the ratio only the block axis to decide. */
+      inline-size: 100%;
+      aspect-ratio: 3 / 1;
+      /* A 3:1 band is only a couple of centimetres tall on a phone, which is
+         not enough to read a title against, and on a wide monitor it is tall
+         enough to push the list itself below the fold. The floor wins on
+         narrow screens, the ceiling on wide ones, and the ratio only decides
+         the sizes in between. */
+      min-block-size: 9rem;
+      max-block-size: 18rem;
+      /* Bottom-aligned so the title sits on the band's lower edge, which is
+         where the scrim below is darkest. */
+      display: flex;
+      align-items: flex-end;
+    }
+
+    .cover-image {
+      position: absolute;
+      inset: 0;
+      inline-size: 100%;
+      block-size: 100%;
+      /* Crop to fill rather than letterbox, from the centre — a portrait
+         photo keeps its middle band instead of being squashed to the
+         banner's shape or sitting in bars. */
+      object-fit: cover;
+      object-position: center;
+    }
+
+    .cover-bar {
+      /* Being positioned at all is enough to paint above the absolutely
+         positioned image, so no z-index is needed here. */
+      position: relative;
+      inline-size: 100%;
+    }
+
+    /* An uploaded photo can be light, dark or busy, so nothing laid over it
+       is legible on its own merits. The scrim is what makes the title and
+       controls safe against an arbitrary image, and fading it upwards keeps
+       it reading as part of the photo rather than as a bar sitting on top. */
+    .cover.has-cover .cover-bar {
+      background: linear-gradient(to top, rgb(0 0 0 / 0.75), rgb(0 0 0 / 0));
+      padding: 3rem 0.5rem 0.5rem;
+    }
+
+    /* Beer's transparent buttons and headings inherit --on-surface, which is
+       near-black in the light theme and would disappear into the scrim. Over
+       a photo the text is always white, in both themes, because the scrim
+       under it is always dark. */
+    .cover.has-cover .cover-bar,
+    .cover.has-cover .cover-bar :is(h5, a, button, i) {
+      color: #fff;
     }
   </style>
 </head>
