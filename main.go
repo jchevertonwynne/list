@@ -51,9 +51,10 @@ func main() {
 		log.Printf("WARNING: -dev-user is set to %q; every unauthenticated request will be treated as that user", *devUser)
 	}
 
+	webServer := web.New(db, *devUser)
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: web.New(db, *devUser).Handler(),
+		Handler: webServer.Handler(),
 		// A service reachable from the internet needs these. Without
 		// ReadHeaderTimeout a single client can hold a connection open
 		// indefinitely by dribbling out headers.
@@ -80,6 +81,17 @@ func main() {
 	log.Print("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// Close the live hub before Shutdown, not after. An SSE stream is an
+	// ordinary handler as far as net/http is concerned — nothing is
+	// hijacked the way a WebSocket upgrade would be — so Shutdown blocks
+	// waiting for every open handler to return, live streams included. Left
+	// running, each one would sit there until the client happened to
+	// disconnect, which on a real deploy means every single rollout burns
+	// the full 10s timeout. Closing the hub first closes every subscriber
+	// channel, which is what makes each stream handler's read loop see a
+	// closed channel and return immediately, so Shutdown actually has
+	// nothing left to wait for. Do not reorder this below Shutdown.
+	webServer.Close()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}

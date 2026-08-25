@@ -109,6 +109,79 @@ func TestHandlerExposesInFlightGauge(t *testing.T) {
 	}
 }
 
+func TestInstrumentPreservesFlushThroughUnwrap(t *testing.T) {
+	// Regression test for statusWriter.Unwrap. Instrument's wrapper embeds
+	// the http.ResponseWriter interface, which hides Flush from a type
+	// assertion; without Unwrap, http.NewResponseController can't walk back
+	// to the underlying writer and Flush silently returns ErrNotSupported —
+	// silently is the problem, since nothing else here would ever catch it.
+	var flushErr error
+	handler := Instrument(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flushErr = http.NewResponseController(w).Flush()
+	}))
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/whatever", nil))
+
+	if flushErr != nil {
+		t.Fatalf("Flush() through Instrument = %v, want nil", flushErr)
+	}
+}
+
+func TestInstrumentExcludesStreamingRoutesFromHistogram(t *testing.T) {
+	// A streaming route (e.g. an SSE handler) can stay open for hours, so it
+	// must never land in the latency histogram — one +Inf observation per
+	// connection would make the histogram meaningless. A normal route on the
+	// same mux must still be recorded as usual.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /gizmos/{id}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := Instrument(mux)
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/live", nil))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/gizmos/7", nil))
+
+	body := renderMetrics(t)
+	if strings.Contains(body, `route="GET /live"`) {
+		t.Fatalf("metrics output should have no series for the streaming route; got:\n%s", body)
+	}
+	wantLine := `http_request_duration_seconds_count{method="GET",route="GET /gizmos/{id}",status="200"} 1`
+	if !strings.Contains(body, wantLine) {
+		t.Fatalf("metrics output missing %q for the non-streaming route; got:\n%s", wantLine, body)
+	}
+}
+
+func TestLiveMetricsAppearAfterHooksCalled(t *testing.T) {
+	// The four exported hooks are the only surface internal/live and
+	// internal/web get, since this package can't depend on theirs. Exercise
+	// each one and check both the values and that Handler() renders them as
+	// proper gauge/counter series, matching the existing metrics' style.
+	LiveConnOpened()
+	LiveConnOpened()
+	LiveConnClosed()
+	LiveEventSent()
+	LiveEventSent()
+	LiveEventSent()
+	LiveEventDropped()
+
+	body := renderMetrics(t)
+	for _, want := range []string{
+		"# TYPE live_connections_active gauge",
+		"live_connections_active 1",
+		"# TYPE live_events_sent_total counter",
+		"live_events_sent_total 3",
+		"# TYPE live_events_dropped_total counter",
+		"live_events_dropped_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics output missing %q; got:\n%s", want, body)
+		}
+	}
+}
+
 func renderMetrics(t *testing.T) string {
 	t.Helper()
 	rec := httptest.NewRecorder()

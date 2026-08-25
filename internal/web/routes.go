@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"list/internal/live"
 	"list/internal/store"
 )
 
@@ -25,19 +26,27 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 
 	mux.HandleFunc("POST /collections", s.handleCreateCollection)
+	mux.HandleFunc("GET /collections", s.handleCollectionsFragment)
 	mux.HandleFunc("GET /collections/{collection}", s.handleCollection)
 	mux.HandleFunc("POST /collections/{collection}/rename", s.handleRenameCollection)
 	mux.HandleFunc("DELETE /collections/{collection}", s.handleDeleteCollection)
 
 	mux.HandleFunc("POST /collections/{collection}/members", s.handleAddMember)
+	mux.HandleFunc("GET /collections/{collection}/members", s.handleMembersFragment)
 	mux.HandleFunc("DELETE /collections/{collection}/members/{user}", s.handleRemoveMember)
 
 	mux.HandleFunc("POST /collections/{collection}/items", s.handleCreateItem)
+	mux.HandleFunc("GET /collections/{collection}/items", s.handleItemsFragment)
 	mux.HandleFunc("GET /collections/{collection}/items/{item}", s.handleItem)
 	mux.HandleFunc("GET /collections/{collection}/items/{item}/edit", s.handleEditItem)
 	mux.HandleFunc("PUT /collections/{collection}/items/{item}", s.handleUpdateItem)
 	mux.HandleFunc("POST /collections/{collection}/items/{item}/toggle", s.handleToggleItem)
 	mux.HandleFunc("DELETE /collections/{collection}/items/{item}", s.handleDeleteItem)
+
+	// All GET, so guardCSRF exempts them and EventSource — which cannot set
+	// headers — can open them directly.
+	mux.HandleFunc("GET /live", s.handleUserLive)
+	mux.HandleFunc("GET /collections/{collection}/live", s.handleCollectionLive)
 }
 
 // ------------------------------------------------------------------ helpers
@@ -58,6 +67,29 @@ func internalError(w http.ResponseWriter, what string, err error) {
 func field(r *http.Request, name string, max int) (string, bool) {
 	v := strings.TrimSpace(r.PostFormValue(name))
 	return v, len(v) <= max
+}
+
+// notifyIndexes tells every member of c that their own index page's progress
+// count for it may have changed. HasUserSubscribers is checked first so a
+// checkbox toggle — the hottest of the mutations that call this — costs
+// nothing beyond that check when nobody has an index page open to notify.
+//
+// A failure here is logged and swallowed rather than surfaced: the mutation
+// this is called after has already succeeded and already has its own
+// response on the way, and any client that misses the notification re-syncs
+// on its next reconnect regardless (see live.js's onopen handling).
+func (s *Server) notifyIndexes(r *http.Request, c store.Collection, origin string) {
+	if !s.live.HasUserSubscribers() {
+		return
+	}
+	members, err := s.store.Members(r.Context(), c.ID)
+	if err != nil {
+		log.Printf("notifyIndexes: Members(%d): %v", c.ID, err)
+		return
+	}
+	for _, m := range members {
+		s.live.Publish(live.UserTopic(m.ID), live.Event{Kind: "collections", Origin: origin})
+	}
 }
 
 // ------------------------------------------------------------- collections
@@ -99,11 +131,29 @@ func (s *Server) handleCreateCollection(w http.ResponseWriter, r *http.Request) 
 		internalError(w, "handleCreateCollection", err)
 		return
 	}
+	s.live.Publish(live.UserTopic(u.ID), live.Event{Kind: "collections", Origin: liveOrigin(r)})
 
 	// Land the user in the thing they just made rather than back on an index
 	// where they would have to find it.
 	w.Header().Set("HX-Redirect", "/collections/"+strconv.FormatInt(c.ID, 10))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCollectionsFragment re-renders the index's collections list on its
+// own, for live.js to re-fetch into #collections on a "collections" event —
+// an owner adds someone, someone is removed, a collection is created or
+// deleted, or the tab was disconnected and is resyncing on reconnect.
+func (s *Server) handleCollectionsFragment(w http.ResponseWriter, r *http.Request) {
+	u, ok := currentUser(w, r)
+	if !ok {
+		return
+	}
+	cols, err := s.store.CollectionsForUser(r.Context(), u.ID)
+	if err != nil {
+		internalError(w, "handleCollectionsFragment: CollectionsForUser", err)
+		return
+	}
+	s.renderFragment(w, "collections", pageData{Collections: cols})
 }
 
 func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +199,9 @@ func (s *Server) handleRenameCollection(w http.ResponseWriter, r *http.Request) 
 		internalError(w, "handleRenameCollection", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "collection", Action: "renamed", Origin: origin})
+	s.notifyIndexes(r, c, origin)
 	// The name appears in the app bar, the page title and the heading;
 	// refreshing is cheaper than three coordinated swaps.
 	w.Header().Set("HX-Refresh", "true")
@@ -160,10 +213,29 @@ func (s *Server) handleDeleteCollection(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	// Membership rows are ON DELETE CASCADE (see the schema in store.go), so
+	// the member list must be captured before DeleteCollection runs — asking
+	// afterwards would find nobody left to notify.
+	members, err := s.store.Members(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleDeleteCollection: Members", err)
+		return
+	}
 	if err := s.store.DeleteCollection(r.Context(), c.ID); err != nil {
 		internalError(w, "handleDeleteCollection", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "collection", Action: "deleted", Origin: origin})
+	for _, m := range members {
+		s.live.Publish(live.UserTopic(m.ID), live.Event{Kind: "collections", Origin: origin})
+	}
+	// Evict last: it closes subscriber channels without draining them, so
+	// publishing first is what guarantees the "deleted" event above is still
+	// delivered — it's already sitting in each subscriber's buffer by the
+	// time Evict runs. Publishing after Evict would drop it entirely.
+	s.live.Evict(live.CollectionTopic(c.ID), 0)
+
 	w.Header().Set("HX-Redirect", "/")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -188,10 +260,14 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.store.AddMember(r.Context(), c.ID, email); err != nil {
+	newMember, err := s.store.AddMember(r.Context(), c.ID, email)
+	if err != nil {
 		internalError(w, "handleAddMember", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "members", Origin: origin})
+	s.live.Publish(live.UserTopic(newMember.ID), live.Event{Kind: "collections", Origin: origin})
 	s.renderMembers(w, r, c)
 }
 
@@ -216,6 +292,15 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "handleRemoveMember", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "members", Origin: origin})
+	s.live.Publish(live.UserTopic(id), live.Event{Kind: "access", Collection: c.ID, Action: "revoked"})
+	s.live.Publish(live.UserTopic(id), live.Event{Kind: "collections", Origin: origin})
+	// Publish before Evict: the "revoked" event above must already be sitting
+	// in the removed member's buffer before their collection-topic subscriber
+	// is closed, or it never gets delivered (see handleDeleteCollection for
+	// the same ordering requirement).
+	s.live.Evict(live.CollectionTopic(c.ID), id)
 	s.renderMembers(w, r, c)
 }
 
@@ -229,6 +314,29 @@ func (s *Server) renderMembers(w http.ResponseWriter, r *http.Request, c store.C
 		Collection: c,
 		Members:    members,
 		IsOwner:    true, // only an owner reaches either caller
+	})
+}
+
+// handleMembersFragment re-renders the People list on its own, for live.js
+// to re-fetch into #members on a "members" event. Unlike renderMembers
+// above, this route is reachable by any member, not just the owner, so
+// IsOwner has to be computed for whoever is actually looking rather than
+// hardcoded — the members fragment gates the remove buttons on it, and a
+// non-owner must not be handed markup for an action they cannot take.
+func (s *Server) handleMembersFragment(w http.ResponseWriter, r *http.Request) {
+	u, c, ok := s.collectionFor(w, r, false)
+	if !ok {
+		return
+	}
+	members, err := s.store.Members(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleMembersFragment: Members", err)
+		return
+	}
+	s.renderFragment(w, "members", pageData{
+		Collection: c,
+		Members:    members,
+		IsOwner:    c.OwnerID == u.ID,
 	})
 }
 
@@ -259,7 +367,27 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "handleCreateItem", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "item", ID: item.ID, Action: "created", Origin: origin})
+	s.notifyIndexes(r, c, origin)
 	s.renderFragment(w, "item", itemCtx{Item: item, Collection: c})
+}
+
+// handleItemsFragment re-renders the whole items list on its own, for
+// live.js to full-resync #items on reconnect. Per-item add/update/delete
+// events use handleItem below instead, so a live edit in progress elsewhere
+// on the page survives — see that comment.
+func (s *Server) handleItemsFragment(w http.ResponseWriter, r *http.Request) {
+	_, c, ok := s.collectionFor(w, r, false)
+	if !ok {
+		return
+	}
+	items, err := s.store.Items(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleItemsFragment: Items", err)
+		return
+	}
+	s.renderFragment(w, "items", pageData{Collection: c, Items: items})
 }
 
 // handleItem re-renders a single row. It exists for the cancel button on the
@@ -319,6 +447,9 @@ func (s *Server) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "handleUpdateItem", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "item", ID: updated.ID, Action: "updated", Origin: origin})
+	s.notifyIndexes(r, c, origin)
 	s.renderFragment(w, "item", itemCtx{Item: updated, Collection: c})
 }
 
@@ -336,6 +467,9 @@ func (s *Server) handleToggleItem(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "handleToggleItem", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "item", ID: updated.ID, Action: "updated", Origin: origin})
+	s.notifyIndexes(r, c, origin)
 	s.renderFragment(w, "item", itemCtx{Item: updated, Collection: c})
 }
 
@@ -356,6 +490,9 @@ func (s *Server) handleDeleteItem(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "handleDeleteItem", err)
 		return
 	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "item", ID: item.ID, Action: "deleted", Origin: origin})
+	s.notifyIndexes(r, c, origin)
 	// An empty body with an outerHTML swap is how the row leaves the page.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

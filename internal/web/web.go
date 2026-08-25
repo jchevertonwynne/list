@@ -8,6 +8,7 @@ import (
 	"context"
 	"net/http"
 
+	"list/internal/live"
 	"list/internal/metrics"
 	"list/internal/store"
 	"list/internal/tracing"
@@ -46,10 +47,20 @@ type Server struct {
 	// empty devUser with no header is a rejected request, never an anonymous
 	// one.
 	devUser string
+	live    *live.Hub
 }
 
 func New(s Store, devUser string) *Server {
-	return &Server{store: s, devUser: devUser}
+	return &Server{store: s, devUser: devUser, live: live.New()}
+}
+
+// Close shuts down everything that outlives a single request. It must run
+// before http.Server.Shutdown — see main.go for why: unlike a hijacked
+// connection, an SSE handler is an ordinary one Shutdown waits for, so
+// closing the hub first is what makes those handlers return promptly instead
+// of holding the shutdown timeout open.
+func (s *Server) Close() {
+	s.live.Close()
 }
 
 // Handler builds the mux. Everything except /healthz, /static/ and /metrics

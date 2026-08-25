@@ -1,5 +1,9 @@
 {{define "title"}}list{{end}}
 
+{{/* The index page subscribes only to its own user topic — there is no
+     collection scope on this page. */}}
+{{define "bodyattrs"}}data-live="/live"{{end}}
+
 {{define "content"}}
 <h5>Your collections</h5>
 
@@ -16,24 +20,5 @@
   <div id="create-error" class="error-text small-text"></div>
 </article>
 
-{{if .Collections}}
-<ul class="list collections border">
-  {{range .Collections}}
-  <li>
-    <div class="max">
-      <a href="/collections/{{.ID}}" class="bold">{{.Name}}</a>
-      <div class="small-text secondary-text">
-        {{.DoneCount}} of {{.ItemCount}} done &middot; owned by {{.OwnerEmail}}
-      </div>
-    </div>
-    <progress class="circle" value="{{.DoneCount}}" max="{{if .ItemCount}}{{.ItemCount}}{{else}}1{{end}}"></progress>
-  </li>
-  {{end}}
-</ul>
-{{else}}
-<article class="border round center-align">
-  <i class="extra">checklist</i>
-  <p class="secondary-text">Nothing here yet. Make a collection above.</p>
-</article>
-{{end}}
+{{template "collections" .}}
 {{end}}

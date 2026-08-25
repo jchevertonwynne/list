@@ -89,3 +89,47 @@
   {{end}}
 </ul>
 {{end}}
+
+{{/* items is the whole item list for a collection page. It exists as its own
+     fragment (rather than living inline in collection.html) so a live-update
+     re-sync after a reconnect, and the full page render, produce identical
+     markup. Context is web.pageData. */}}
+{{define "items"}}
+<ul class="list items border" id="items">
+  {{$c := .Collection}}
+  {{range .Items}}
+    {{template "item" (itemCtx .  $c)}}
+  {{end}}
+</ul>
+{{end}}
+
+{{/* collections is the whole index-page list, including the empty state, as
+     one fragment wrapped in a single #collections element — so a live update
+     (someone else's collection appearing or a count changing) can swap the
+     page between the populated and empty states with one outerHTML request
+     instead of the caller having to know which state it currently shows.
+     Context is web.pageData. */}}
+{{define "collections"}}
+<div id="collections">
+{{if .Collections}}
+<ul class="list collections border">
+  {{range .Collections}}
+  <li>
+    <div class="max">
+      <a href="/collections/{{.ID}}" class="bold">{{.Name}}</a>
+      <div class="small-text secondary-text">
+        {{.DoneCount}} of {{.ItemCount}} done &middot; owned by {{.OwnerEmail}}
+      </div>
+    </div>
+    <progress class="circle" value="{{.DoneCount}}" max="{{if .ItemCount}}{{.ItemCount}}{{else}}1{{end}}"></progress>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<article class="border round center-align">
+  <i class="extra">checklist</i>
+  <p class="secondary-text">Nothing here yet. Make a collection above.</p>
+</article>
+{{end}}
+</div>
+{{end}}

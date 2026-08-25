@@ -40,6 +40,59 @@ var (
 	inFlight int64
 )
 
+// streamingRoutes holds the route patterns whose responses are long-lived
+// SSE streams rather than ordinary request/response cycles. Instrument
+// checks this to keep those connections out of the latency histogram and
+// in-flight gauge — see the comment where it's consulted for why.
+var streamingRoutes = map[string]bool{
+	"GET /live":                          true,
+	"GET /collections/{collection}/live": true,
+}
+
+// live* track the SSE hub's own lifecycle, separately from the request
+// metrics above: a stream is one long-lived "request" by HTTP's accounting
+// but is really a connection with its own open/close and per-event
+// counters, so it gets gauge/counter semantics instead of a latency
+// histogram. Plain int64s with atomic ops, matching inFlight above, rather
+// than the sync/atomic typed wrappers — no reason to mix styles in a file
+// this small.
+var (
+	liveConnsActive   int64
+	liveEventsSent    int64
+	liveEventsDropped int64
+)
+
+// LiveConnOpened records that an SSE stream started serving. Call sites
+// live in internal/live and internal/web, which is why this is exported —
+// this package must stay dependency-free, so it can't import theirs to wire
+// the callback the other way around.
+func LiveConnOpened() {
+	atomic.AddInt64(&liveConnsActive, 1)
+}
+
+// LiveConnClosed records that an SSE stream stopped serving, for whatever
+// reason (client disconnect, slow-consumer drop, server shutdown).
+func LiveConnClosed() {
+	atomic.AddInt64(&liveConnsActive, -1)
+}
+
+// LiveEventSent records one event successfully queued to a subscriber's
+// channel.
+func LiveEventSent() {
+	atomic.AddInt64(&liveEventsSent, 1)
+}
+
+// LiveEventDropped records one event that couldn't be delivered because the
+// subscriber's buffered channel was full. The hub sends without blocking, so
+// a reader that has stalled costs it an event rather than costing every
+// publisher — which in this app means an HTTP handler — a stall of its own.
+// That trade is only defensible while it stays visible, and this counter is
+// what makes it visible; a persistently rising value means subscribers are
+// being dropped and resyncing rather than streaming.
+func LiveEventDropped() {
+	atomic.AddInt64(&liveEventsDropped, 1)
+}
+
 // patternHandler is the one method of *http.ServeMux that Instrument needs:
 // the matched route pattern (e.g. "GET /entries/{id}"), not the raw path
 // (e.g. "GET /entries/42"). Labeling by raw path would give the histogram
@@ -67,9 +120,6 @@ type patternHandler interface {
 // reason.
 func Instrument(h http.Handler, extraRouters ...patternHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&inFlight, 1)
-		defer atomic.AddInt64(&inFlight, -1)
-
 		route := ""
 		if router, ok := h.(patternHandler); ok {
 			if _, pattern := router.Handler(r); pattern != "" {
@@ -85,10 +135,25 @@ func Instrument(h http.Handler, extraRouters ...patternHandler) http.Handler {
 			route = "unmatched"
 		}
 
+		// The route has to be known before the in-flight gauge is touched,
+		// not after, because streaming routes must never increment it: an
+		// SSE connection can stay open for hours, and a gauge that only goes
+		// up for the duration of a stream is a gauge that lies about load
+		// for hours. Same reasoning excludes them from record() below —
+		// live_connections_active (see LiveConnOpened/Closed) is the correct
+		// gauge for those connections, not this one.
+		streaming := streamingRoutes[route]
+		if !streaming {
+			atomic.AddInt64(&inFlight, 1)
+			defer atomic.AddInt64(&inFlight, -1)
+		}
+
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		h.ServeHTTP(sw, r)
-		record(r.Method, route, sw.status, time.Since(start).Seconds())
+		if !streaming {
+			record(r.Method, route, sw.status, time.Since(start).Seconds())
+		}
 	})
 }
 
@@ -104,6 +169,20 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap gives back the wrapped ResponseWriter so http.NewResponseController
+// can see through this wrapper to whatever the underlying writer actually
+// supports. Without it, embedding the http.ResponseWriter interface (rather
+// than a concrete type) hides Flush/Hijack/deadline-setting from
+// ResponseController entirely — it has no interface to type-assert and no
+// Unwrap chain to walk, so it returns http.ErrNotSupported even though the
+// real connection supports flushing fine. That's silent: nothing panics or
+// logs, a streaming handler just never gets its bytes out until the buffer
+// fills or the connection ends, which is exactly what SSE cannot tolerate.
+// otelhttp, which wraps outside this middleware, doesn't have this problem
+// because it uses httpsnoop.Wrap, which preserves the concrete writer's
+// optional interfaces by construction instead of relying on Unwrap.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func record(method, route string, status int, seconds float64) {
 	mu.Lock()
@@ -164,5 +243,17 @@ func Handler() http.Handler {
 		fmt.Fprintln(w, "# HELP http_requests_in_flight HTTP requests currently being served.")
 		fmt.Fprintln(w, "# TYPE http_requests_in_flight gauge")
 		fmt.Fprintf(w, "http_requests_in_flight %d\n", atomic.LoadInt64(&inFlight))
+
+		fmt.Fprintln(w, "# HELP live_connections_active Open SSE live-update streams.")
+		fmt.Fprintln(w, "# TYPE live_connections_active gauge")
+		fmt.Fprintf(w, "live_connections_active %d\n", atomic.LoadInt64(&liveConnsActive))
+
+		fmt.Fprintln(w, "# HELP live_events_sent_total Live-update events written to a subscriber.")
+		fmt.Fprintln(w, "# TYPE live_events_sent_total counter")
+		fmt.Fprintf(w, "live_events_sent_total %d\n", atomic.LoadInt64(&liveEventsSent))
+
+		fmt.Fprintln(w, "# HELP live_events_dropped_total Live-update events dropped because a subscriber's buffer was full.")
+		fmt.Fprintln(w, "# TYPE live_events_dropped_total counter")
+		fmt.Fprintf(w, "live_events_dropped_total %d\n", atomic.LoadInt64(&liveEventsDropped))
 	})
 }

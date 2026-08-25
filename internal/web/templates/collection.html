@@ -1,5 +1,10 @@
 {{define "title"}}{{.Collection.Name}}{{end}}
 
+{{/* A collection page needs both scopes: collection:{id} for the list itself,
+     user:{id} (via the same /live subscription mechanism as the index) for
+     "you lost access" and index-affecting events. */}}
+{{define "bodyattrs"}}data-live="/collections/{{.Collection.ID}}/live" data-collection="{{.Collection.ID}}"{{end}}
+
 {{define "content"}}
 <nav>
   <a href="/" class="button circle transparent"><i>arrow_back</i></a>
@@ -26,12 +31,7 @@
   <div id="item-error" class="error-text small-text"></div>
 </article>
 
-<ul class="list items border" id="items">
-  {{$c := .Collection}}
-  {{range .Items}}
-    {{template "item" (itemCtx .  $c)}}
-  {{end}}
-</ul>
+{{template "items" .}}
 
 <h6>People</h6>
 {{template "members" .}}

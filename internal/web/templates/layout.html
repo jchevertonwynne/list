@@ -4,6 +4,11 @@
     data; this file only ever references those two names, never defines
     them, so a page can't accidentally shadow another page's content.
 
+    Every page must also define "bodyattrs" — the attributes live.js reads to
+    know what to subscribe to — even a page with nothing to say defines it as
+    empty, because html/template errors on an undefined template rather than
+    rendering nothing.
+
     Data contract: a struct with at least .UserEmail and .Title.
 */}}
 {{define "layout"}}
@@ -26,6 +31,7 @@
   <link rel="stylesheet" href="/static/beer.min.css">
   <script type="module" src="/static/beer.min.js"></script>
   <script src="/static/htmx.min.js"></script>
+  <script src="/static/live.js" defer></script>
 
   <style>
     /* Only what Beer CSS doesn't already give us for this app's lists.
@@ -66,7 +72,7 @@
     }
   </style>
 </head>
-<body>
+<body {{template "bodyattrs" .}}>
   <header>
     <nav class="top">
       <h5 class="max">list</h5>
