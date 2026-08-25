@@ -47,6 +47,11 @@ type Store interface {
 	// for why the collection page uses it and the serving path below does not.
 	CollectionImageETag(ctx context.Context, collectionID int64) (etag string, width, height int, err error)
 	DeleteCollectionImage(ctx context.Context, collectionID int64) error
+
+	// Backup writes a consistent snapshot of the database to dest, which must
+	// not already exist. See handleBackup for why this is an endpoint at all
+	// rather than something a backup job does by copying the file.
+	Backup(ctx context.Context, dest string) error
 }
 
 // Server holds the dependencies every handler needs.
@@ -73,17 +78,23 @@ func (s *Server) Close() {
 	s.live.Close()
 }
 
-// Handler builds the mux. Everything except /healthz, /static/ and /metrics
-// sits behind authentication.
+// Handler builds the mux. Everything except /healthz, /static/, /metrics and
+// /backup.db sits behind authentication.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// Unauthenticated: the probes must not depend on Access, the assets are
 	// the same for everyone, and Alloy scraping /metrics has no Access
-	// session to present.
+	// session to present. /backup.db is here for that last reason and no
+	// other — the hourly backup CronJob calls it from inside the cluster,
+	// where there is no Access session to present either. Read the comment on
+	// handleBackup before adding anything else to this list: what is
+	// acceptable for a metrics scrape is a longer argument for a database
+	// dump.
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.Handle("GET /static/", staticHandler())
 	mux.Handle("GET /metrics", metrics.Handler())
+	mux.HandleFunc("GET /backup.db", s.handleBackup)
 
 	// Authenticated application routes are registered on their own mux so a
 	// single wrapper covers all of them — a route added later cannot forget

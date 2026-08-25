@@ -312,9 +312,13 @@ Two things worth knowing if you're touching this next:
 | `GET /live` | SSE stream for the index page — see [Live updates](#live-updates) |
 | `GET /collections/{id}/live` | SSE stream for a collection page |
 | `GET /healthz` | Liveness. No auth, no database |
+| `GET /backup.db` | A consistent snapshot for the backup CronJob. No auth — see [Backups](#backups) |
 
-Everything except `/healthz` and `/static/` is behind authentication, wired as
-a single wrapper around one mux so a route added later cannot forget it.
+Everything except `/healthz`, `/static/`, `/metrics` and `/backup.db` is behind
+authentication, wired as a single wrapper around one mux so a route added later
+cannot forget it. The four exceptions are registered on the outer mux instead,
+which is what puts them outside that wrapper — each for a reason given where it
+is defined.
 
 ## Run locally
 
@@ -345,25 +349,45 @@ pods cannot both hold it. The cost is a few seconds of 502 per deploy.
 
 ## Backups
 
-There is no shell in the image — it is `FROM scratch`, so `kubectl exec` is
-not an option and neither is `sqlite3`. Back it up from the node instead: the
-PVC is a directory under `/var/lib/rancher/k3s/storage` on the Pi.
+`GET /backup.db` streams a consistent snapshot, and the hourly backup CronJob
+in [homelab](https://github.com/jchevertonwynne/homelab) calls it and commits
+the result to `homelab-backups`. Nothing manual is required.
 
 ```sh
-ssh jcw@jcwpi 'sudo find /var/lib/rancher/k3s/storage -name list.db'
+kubectl -n apps port-forward deploy/list 8094:8094
+curl -sO http://localhost:8094/backup.db
 ```
 
-Copy it while the Deployment is scaled to zero. WAL mode means a live copy of
-`list.db` alone can miss recent commits sitting in `list.db-wal`.
+It is a `VACUUM INTO` through the running process, which is the only way to
+get a consistent copy without stopping the app — and stopping the app is what
+every other option requires. There is no shell in the image (`FROM scratch`),
+so `kubectl exec` is not available and neither is `sqlite3`. Copying the files
+off the PVC on the node looks like the obvious alternative and quietly loses
+data: under WAL mode recent commits sit in `list.db-wal`, which here is
+routinely *larger* than `list.db` itself, so a copy of the database alone can
+come back as a valid, openable, empty database — which is a far worse outcome
+than an error. Copying all three files together is a torn read unless the pod
+is stopped first, which turns an hourly backup into hourly downtime.
 
-`list.db` now grows with cover image data, not just rows of text, and
+Two things about that endpoint are worth knowing rather than rediscovering.
+It is unauthenticated at the application level, like `/metrics`, because the
+CronJob calls it from inside the cluster where there is no Cloudflare Access
+session to present — so what protects it is Access on the hostname and
+nothing else, and anyone the allowlist admits can fetch the whole database in
+one request. And it does real work proportional to the database size, with no
+rate limit, which is acceptable only because that same sentence bounds who
+can call it. See `internal/web/backup.go`.
+
+`list.db` grows with cover image data, not just rows of text, and
 `list.db-wal` will routinely run to several megabytes: upserting a
 few-hundred-kilobyte blob rewrites that row's overflow pages, and WAL mode
 defers folding those pages back into the main file until a checkpoint. A
 removed cover frees its pages, but SQLite never hands them back to the
-filesystem on its own — there is no `VACUUM` anywhere in this codebase, and
-`auto_vacuum` cannot be turned on for a file that already exists without
-running one, since it only takes effect on the next database created from
-scratch. So `list.db` only grows over time, even as covers are replaced and
-removed; that is an accepted trade-off for a household list on a Pi with
+filesystem on its own. Nothing compacts `list.db` in place: the `VACUUM INTO`
+behind `/backup.db` writes a *new* file and leaves the original exactly as
+large as it was, which is why the snapshot in `homelab-backups` can be
+noticeably smaller than the database it came from. And `auto_vacuum` cannot be
+turned on for a file that already exists without running a plain `VACUUM`,
+since it only takes effect on the next database created from scratch. So
+`list.db` only grows over time, even as covers are replaced and removed; that is an accepted trade-off for a household list on a Pi with
 disk to spare, not an oversight.

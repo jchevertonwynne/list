@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -105,6 +106,20 @@ func (f *fakeStore) CollectionImageETag(ctx context.Context, collectionID int64)
 func (f *fakeStore) DeleteCollectionImage(ctx context.Context, collectionID int64) error {
 	return nil
 }
+
+// Backup writes a token file rather than doing nothing, so that a test can
+// assert handleBackup streams what the store produced. It also honours f.err,
+// which is what the failure-path test needs.
+func (f *fakeStore) Backup(ctx context.Context, dest string) error {
+	if f.err != nil {
+		return f.err
+	}
+	return os.WriteFile(dest, []byte(backupFixture), 0o600)
+}
+
+// backupFixture stands in for a SQLite file. handleBackup neither parses nor
+// validates what Backup wrote, so bytes are enough.
+const backupFixture = "not-really-sqlite-but-bytes-are-bytes"
 
 // downstreamSpy is the next handler in the chain. It records whether it ran
 // at all — the security property under test is as much "did not call next"

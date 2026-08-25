@@ -700,3 +700,33 @@ func (d *DB) DeleteCollectionImage(ctx context.Context, collectionID int64) erro
 		return nil
 	})
 }
+
+// Backup writes a consistent snapshot of the whole database to dest.
+//
+// VACUUM INTO rather than copying the file, and the reason is not caution but
+// arithmetic: this database runs in WAL mode, where a commit lands in
+// list.db-wal and is only folded back into list.db at a checkpoint. On the Pi
+// today the WAL is routinely *larger* than the database itself — covers push
+// several megabytes of overflow pages through it — so a copy of list.db alone
+// silently omits the most recent writes. VACUUM INTO goes through the open
+// connection, so it sees the committed state including everything still in the
+// WAL, and it does it without blocking writers or stopping the app.
+//
+// It also produces a compacted file, which is a real benefit here: covers are
+// stored as blobs and nothing ever runs a plain VACUUM, so list.db only grows
+// as covers are replaced or removed. The snapshot is the size the data
+// actually is.
+//
+// dest must not already exist — SQLite refuses to overwrite, deliberately, and
+// that error is passed straight through rather than being papered over with a
+// remove. Callers pass a fresh path inside a temporary directory they own.
+func (d *DB) Backup(ctx context.Context, dest string) error {
+	return withSpanErr(ctx, "Backup", func(ctx context.Context) error {
+		// A bound parameter is fine here, unlike PRAGMA above: VACUUM INTO
+		// takes an ordinary expression for its target.
+		if _, err := d.db.ExecContext(ctx, `VACUUM INTO ?`, dest); err != nil {
+			return fmt.Errorf("vacuum into %s: %w", dest, err)
+		}
+		return nil
+	})
+}
