@@ -254,7 +254,10 @@ func TestStreamContentTypeAndPreamble(t *testing.T) {
 }
 
 // The whole point of live updates: a mutation made by one browser must reach
-// another browser's open stream, carrying enough to identify the item.
+// another browser's open stream. Creating publishes the whole-list "items"
+// event rather than a per-item one, because a new undone item belongs at the
+// end of the undone group — above any done items — so the client cannot just
+// append it and has to re-fetch the list.
 func TestItemCreateReachesStream(t *testing.T) {
 	h, db := newTestServer(t)
 	c, _ := fixture(t, db)
@@ -269,15 +272,8 @@ func TestItemCreateReachesStream(t *testing.T) {
 		t.Fatalf("creating item = %d, want 200", rec.Code)
 	}
 
-	items, err := db.Items(context.Background(), c.ID)
-	if err != nil {
-		t.Fatalf("Items: %v", err)
-	}
-	newItem := items[len(items)-1] // id-ordered; the fixture's "milk" plus this "bread" sorts last
-
-	ev := mustReadEventOfKind(t, r, "item")
-	if ev.Action != "created" || ev.ID != newItem.ID {
-		t.Fatalf("event = %+v, want kind=item action=created id=%d", ev, newItem.ID)
+	if ev := mustReadEventOfKind(t, r, "items"); ev.Kind != "items" {
+		t.Fatalf("event = %+v, want kind=items", ev)
 	}
 }
 
@@ -300,15 +296,18 @@ func TestOriginIsStampedOnEvent(t *testing.T) {
 		t.Fatalf("creating item = %d, want 200", rec.Code)
 	}
 
-	ev := mustReadEventOfKind(t, r, "item")
+	ev := mustReadEventOfKind(t, r, "items")
 	if ev.Origin != tab {
 		t.Errorf("event origin = %q, want %q", ev.Origin, tab)
 	}
 }
 
 // Toggling and deleting are the two other item mutations besides create, and
-// each must carry the id of the item it acted on so the client can find the
-// right row without a full-list refresh (see live.js's itemRow lookup).
+// they publish deliberately different shapes. A tick moves the row — done
+// items sort to the bottom — so it can only be communicated as a whole-list
+// event. A delete leaves every other row where it was, so it stays a per-item
+// event carrying the id, which is what lets the client drop that one row
+// without disturbing an edit form open elsewhere on the page.
 func TestToggleAndDeleteEvents(t *testing.T) {
 	h, db := newTestServer(t)
 	c, item := fixture(t, db)
@@ -323,8 +322,8 @@ func TestToggleAndDeleteEvents(t *testing.T) {
 	if rec := do(t, h, http.MethodPost, itemPath+"/toggle", owner, nil); rec.Code != http.StatusOK {
 		t.Fatalf("toggling item = %d, want 200", rec.Code)
 	}
-	if ev := mustReadEventOfKind(t, r, "item"); ev.Action != "updated" || ev.ID != item.ID {
-		t.Errorf("toggle event = %+v, want action=updated id=%d", ev, item.ID)
+	if ev := mustReadEventOfKind(t, r, "items"); ev.Kind != "items" {
+		t.Errorf("toggle event = %+v, want kind=items", ev)
 	}
 
 	if rec := do(t, h, http.MethodDelete, itemPath, owner, nil); rec.Code != http.StatusOK {

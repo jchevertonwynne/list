@@ -14,14 +14,14 @@
 <article class="border round">
   <form hx-post="/collections/{{.Collection.ID}}/items"
         hx-target="#items"
-        hx-swap="beforeend"
+        hx-swap="outerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div class="field label border">
-      <input type="text" name="title" maxlength="200" required autocomplete="off">
+      <input type="text" name="title" maxlength="200" required autocomplete="off" placeholder=" ">
       <label>New item</label>
     </div>
     <div class="field textarea label border">
-      <textarea name="body" maxlength="4000"></textarea>
+      <textarea name="body" maxlength="4000" placeholder=" "></textarea>
       <label>Notes (optional)</label>
     </div>
     <nav class="right-align">
@@ -33,7 +33,7 @@
 
 {{template "items" .}}
 
-<h6>People</h6>
+<h6 class="section-heading">People</h6>
 {{template "members" .}}
 
 {{if .IsOwner}}
@@ -44,7 +44,7 @@
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <nav>
       <div class="field label border max">
-        <input type="email" name="email" maxlength="320" required autocomplete="off">
+        <input type="email" name="email" maxlength="320" required autocomplete="off" placeholder=" ">
         <label>Invite by email</label>
       </div>
       <button type="submit"><i>person_add</i></button>
@@ -61,7 +61,7 @@
   <form hx-post="/collections/{{.Collection.ID}}/rename">
     <nav>
       <div class="field label border max">
-        <input type="text" name="name" value="{{.Collection.Name}}" maxlength="200" required>
+        <input type="text" name="name" value="{{.Collection.Name}}" maxlength="200" required placeholder=" ">
         <label>Rename</label>
       </div>
       <button type="submit">Save</button>

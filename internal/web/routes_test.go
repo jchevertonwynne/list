@@ -290,6 +290,81 @@ func TestFullLifecycle(t *testing.T) {
 	}
 }
 
+// A member may reorder items on a collection they belong to — the same bar
+// as every other item mutation — and a stranger gets the usual 404 rather
+// than a 403 that would confirm the collection exists.
+func TestReorderItems(t *testing.T) {
+	h, db := newTestServer(t)
+	c, item := fixture(t, db)
+
+	second, err := db.CreateItem(context.Background(), c.ID, c.OwnerID, "bread", "")
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	order := strconv.FormatInt(second.ID, 10) + "," + strconv.FormatInt(item.ID, 10)
+	rec := do(t, h, http.MethodPost, path(c, "/items/reorder"), member, url.Values{"order": {order}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("member reordering = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `id="items"`) {
+		t.Errorf("reorder response missing the items fragment: %s", rec.Body.String())
+	}
+
+	items, err := db.Items(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("Items: %v", err)
+	}
+	if len(items) != 2 || items[0].ID != second.ID || items[1].ID != item.ID {
+		t.Fatalf("order after reorder = %+v, want [%d, %d]", items, second.ID, item.ID)
+	}
+
+	rec = do(t, h, http.MethodPost, path(c, "/items/reorder"), stranger, url.Values{"order": {order}})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("stranger reordering = %d, want 404", rec.Code)
+	}
+}
+
+// A malformed order value — anything that is not a comma-separated list of
+// integers — is a validation failure, not a server error.
+func TestReorderItemsRejectsMalformedOrder(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	cases := []struct {
+		name  string
+		order string
+	}{
+		{"empty", ""},
+		{"not a number", "abc"},
+		{"trailing comma with junk", "1,2,xyz"},
+	}
+	for _, tc := range cases {
+		rec := do(t, h, http.MethodPost, path(c, "/items/reorder"), owner, url.Values{"order": {tc.order}})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("%s: order=%q = %d, want 422", tc.name, tc.order, rec.Code)
+		}
+	}
+}
+
+// Ticking an item moves it in the render order (done items sink to the
+// bottom), so the response has to be the whole list, not the single row the
+// old per-item fragment returned — otherwise the row would stay stuck in its
+// old spot in the DOM until the next full refresh.
+func TestToggleReturnsWholeList(t *testing.T) {
+	h, db := newTestServer(t)
+	c, item := fixture(t, db)
+	itemPath := path(c, "/items/"+strconv.FormatInt(item.ID, 10))
+
+	rec := do(t, h, http.MethodPost, itemPath+"/toggle", owner, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("toggling = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `id="items"`) {
+		t.Errorf("toggle response is not the whole items fragment: %s", rec.Body.String())
+	}
+}
+
 // html/template must escape a title someone typed, not execute it.
 func TestItemTitleIsEscaped(t *testing.T) {
 	h, db := newTestServer(t)

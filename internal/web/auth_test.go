@@ -74,6 +74,10 @@ func (f *fakeStore) DeleteItem(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (f *fakeStore) ReorderItems(ctx context.Context, collectionID int64, ids []int64) error {
+	return nil
+}
+
 func (f *fakeStore) Members(ctx context.Context, collectionID int64) ([]store.User, error) {
 	return nil, nil
 }

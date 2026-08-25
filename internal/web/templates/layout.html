@@ -31,12 +31,96 @@
   <link rel="stylesheet" href="/static/beer.min.css">
   <script type="module" src="/static/beer.min.js"></script>
   <script src="/static/htmx.min.js"></script>
+  <script src="/static/sortable.min.js"></script>
   <script src="/static/live.js" defer></script>
+  <script src="/static/reorder.js" defer></script>
 
   <style>
     /* Only what Beer CSS doesn't already give us for this app's lists.
        Everything else — colour, elevation, ripples — is Beer's job;
        duplicating it here would fight the theme instead of using it. */
+
+    /* Beer styles <details>/<summary> only inside a .list > li. A standalone
+       one — the collection settings disclosure — gets .border's box and
+       .round's corners with no padding at all, so its label renders flush
+       against the border and the line strikes through the text. Beer gives
+       <article> its padding from the same --_padding custom property, so
+       reusing it here keeps the disclosure the same size as the cards it
+       sits among rather than guessing a matching number. */
+    details.border {
+      padding: 1rem;
+    }
+
+    details.border > summary {
+      /* The marker is hidden by Beer, so without this the label has no
+         affordance at all — nothing says the box opens. */
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-block-size: 1.5rem;
+    }
+
+    details.border > summary::after {
+      font-family: var(--font-icon);
+      content: "expand_more";
+      margin-inline-start: auto;
+      transition: transform var(--speed2);
+    }
+
+    details.border[open] > summary::after {
+      transform: rotate(180deg);
+    }
+
+    /* An open disclosure needs air between its label and its contents, or
+       the rename field collides with the summary line. */
+    details.border[open] > summary {
+      margin-block-end: 1rem;
+    }
+
+    /* The app bar is sticky, so content passes underneath it. Without an
+       edge the two simply overlap and the bar stops reading as a bar. */
+    header.fixed {
+      border-block-end: 0.0625rem solid var(--outline-variant);
+    }
+
+    /* Same shrink problem as an item row: the owner's address would
+       otherwise set a floor on the row's width. */
+    .list.collections > li > .max {
+      min-inline-size: 0;
+    }
+
+    .collection-meta {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .collection-progress {
+      inline-size: 100%;
+      block-size: 0.25rem;
+      margin-block-start: 0.5rem;
+    }
+
+    /* Every .field.label input carries placeholder=" ". Beer floats a field's
+       label with the selector [placeholder]:not(:placeholder-shown)+label, so
+       an input with no placeholder attribute can never match it: the label
+       stays at resting size and sits on top of the value. That is why the
+       rename field rendered its label through "swag". The blank placeholder
+       is invisible but makes the selector reachable, which also fixes the
+       label dropping back over text when a filled field loses focus — until
+       now only :focus was floating it. */
+
+    /* The signed-in address is the longest string in the app bar and the
+       least important thing in it. On a phone it would otherwise push the
+       title out or wrap the bar to two lines. */
+    .user-email {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-inline-size: 45vw;
+    }
 
     /* Beer's <ul class="list"> rows have no vertical breathing room by
        default, which reads fine for a menu but cramped for a row that
@@ -46,9 +130,28 @@
       padding-block: 0.75rem;
     }
 
-    /* A completed item stays in place rather than disappearing, so
-       undoing a mistake doesn't mean hunting for the item again — it
-       just looks done. */
+    /* An item row carries five controls once the drag handle is there —
+       handle, checkbox, text, edit, delete — and Beer's default 1rem gap
+       spends more of a phone's width on space than on the buttons. */
+    .list.items > li {
+      gap: 0.5rem;
+    }
+
+    /* Beer sets white-space: nowrap on list rows, which suits a menu label
+       but here means the longest line (usually "added by <address>") sets a
+       floor on the row's width. Combined with a flex child that cannot
+       shrink below its content, that pushed the delete button off the right
+       edge of a phone screen. min-inline-size:0 is what actually lets the
+       text column shrink; without it flex refuses to go below min-content. */
+    .item > .max {
+      min-inline-size: 0;
+      white-space: normal;
+    }
+
+    /* A completed item stays legible rather than disappearing, so undoing a
+       mistake doesn't mean hunting for the item again — it just looks done.
+       Done items also sort to the bottom (see store.Items), so this is the
+       only signal distinguishing them once they get there. */
     .item.done .item-title {
       text-decoration: line-through;
       opacity: 0.6;
@@ -60,6 +163,8 @@
 
     .item-title {
       font-weight: 500;
+      line-height: 1.35;
+      white-space: normal;
     }
 
     /* Item bodies are free text a user typed, not UI copy — they can be
@@ -69,18 +174,75 @@
     .item-body {
       overflow-wrap: break-word;
       white-space: pre-wrap;
+      line-height: 1.4;
+      margin-block-start: 0.125rem;
+    }
+
+    /* Who added an item is provenance, not content: useful when two people
+       share a list, noise the rest of the time. Sizing it down keeps it
+       from competing with the title for the eye. */
+    .item-meta {
+      margin-block-start: 0.25rem;
+      opacity: 0.7;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* The drag handle is the only part of a row that starts a drag (see
+       reorder.js's handle option), so it has to look grabbable and stay out
+       of the way of the checkbox next to it. */
+    .drag-handle {
+      cursor: grab;
+      opacity: 0.35;
+      touch-action: none;
+      transition: opacity var(--speed2);
+    }
+
+    .drag-handle:hover,
+    .drag-handle:focus-visible {
+      opacity: 0.9;
+    }
+
+    /* A done item can't be dragged — its position is decided by the sort,
+       not by hand — so it must not advertise a handle it won't honour. */
+    .item.done .drag-handle {
+      visibility: hidden;
+    }
+
+    /* Sortable's classes. The ghost is the gap the row will land in; the
+       chosen row is the one under the finger. Beer has no opinion on
+       either, so they are invisible without this. */
+    .item.sortable-ghost {
+      opacity: 0.35;
+    }
+
+    .item.sortable-chosen .drag-handle {
+      cursor: grabbing;
+      opacity: 1;
+    }
+
+    /* Section headings between cards read as floating text without this —
+       they need to sit closer to what they label than to what precedes it. */
+    .section-heading {
+      margin-block: 2rem 0.5rem;
     }
   </style>
 </head>
 <body {{template "bodyattrs" .}}>
-  <header>
-    <nav class="top">
-      <h5 class="max">list</h5>
-      <span>{{.UserEmail}}</span>
-    </nav>
-  </header>
-
   <main class="responsive">
+    <!-- Beer's header.fixed is built to be a child of the padded container
+         it sticks to: it uses negative insets derived from that container's
+         own --_padding to bleed to its edges. Placed outside <main> it has
+         nothing to derive them from, which is what left the bar floating
+         inset from the left instead of spanning the page. -->
+    <header class="fixed">
+      <nav>
+        <h5 class="max">list</h5>
+        <span class="small-text secondary-text user-email">{{.UserEmail}}</span>
+      </nav>
+    </header>
+
     {{template "content" .}}
   </main>
 </body>

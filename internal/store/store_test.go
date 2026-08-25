@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // open is the shared test helper: a temp file DB, not :memory:. An in-memory
@@ -223,6 +224,305 @@ func TestItemAndDoneCountsAggregate(t *testing.T) {
 		if it.CreatorEmail != "owner@example.com" {
 			t.Fatalf("CreatorEmail not resolved via join: %+v", it)
 		}
+	}
+}
+
+// positionOf reads the position column directly, bypassing ItemView (which
+// does not expose it — nothing outside this package needs to see a raw
+// position, only the relative order it produces). Safe because store_test.go
+// is part of package store and can reach the unexported *sql.DB underneath.
+func positionOf(t *testing.T, db *DB, id int64) int64 {
+	t.Helper()
+	var pos int64
+	if err := db.db.QueryRowContext(context.Background(), `SELECT position FROM items WHERE id = ?`, id).Scan(&pos); err != nil {
+		t.Fatalf("query position of item %d: %v", id, err)
+	}
+	return pos
+}
+
+// TestBackfillSeedsPositionFromID simulates upgrading a database that
+// predates the position column. Rows inserted before that migration must end
+// up with position equal to their id, not all crammed onto the column
+// default of 0 — sharing 0 would make every one of them depend on the id
+// tiebreak in Items' ORDER BY by accident rather than by the explicit
+// backfill this migration performs.
+func TestBackfillSeedsPositionFromID(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "list.db")
+
+	// Open against only the migrations that predate the position column, so
+	// the items table on disk has no position column yet.
+	prePosition := len(migrations) - 2 // the ALTER TABLE and the backfill UPDATE
+	original := migrations
+	migrations = migrations[:prePosition]
+	db, err := Open(path)
+	migrations = original
+	if err != nil {
+		t.Fatalf("Open (pre-position schema): %v", err)
+	}
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	// Raw inserts rather than CreateItem: CreateItem's INSERT already
+	// targets the position column added by the migration under test, so it
+	// cannot be used to populate a database that predates it.
+	now := time.Now().Unix()
+	res1, err := db.db.ExecContext(ctx, `
+		INSERT INTO items (collection_id, title, body, creator_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, c.ID, "Milk", "", owner.ID, now, now)
+	if err != nil {
+		t.Fatalf("insert pre-migration item: %v", err)
+	}
+	id1, _ := res1.LastInsertId()
+	res2, err := db.db.ExecContext(ctx, `
+		INSERT INTO items (collection_id, title, body, creator_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, c.ID, "Eggs", "", owner.ID, now, now)
+	if err != nil {
+		t.Fatalf("insert pre-migration item: %v", err)
+	}
+	id2, _ := res2.LastInsertId()
+	db.Close()
+
+	// Reopening with the full migration list runs the ALTER and the backfill
+	// against these pre-existing rows.
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (post-position schema): %v", err)
+	}
+	defer db2.Close()
+
+	if got := positionOf(t, db2, id1); got != id1 {
+		t.Fatalf("position of item %d = %d, want %d", id1, got, id1)
+	}
+	if got := positionOf(t, db2, id2); got != id2 {
+		t.Fatalf("position of item %d = %d, want %d", id2, got, id2)
+	}
+}
+
+// TestItemsOrdersUndoneBeforeDoneByPosition is the core property of the new
+// sort: every undone item, in drag order, then every done item, in its own
+// drag order — not one flat position ordering that ignores done.
+func TestItemsOrdersUndoneBeforeDoneByPosition(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	a, _ := db.CreateItem(ctx, c.ID, owner.ID, "A", "")
+	b, _ := db.CreateItem(ctx, c.ID, owner.ID, "B", "")
+	cc, _ := db.CreateItem(ctx, c.ID, owner.ID, "C", "")
+	d, _ := db.CreateItem(ctx, c.ID, owner.ID, "D", "")
+
+	if _, err := db.ToggleItem(ctx, b.ID); err != nil {
+		t.Fatalf("ToggleItem B: %v", err)
+	}
+	if _, err := db.ToggleItem(ctx, d.ID); err != nil {
+		t.Fatalf("ToggleItem D: %v", err)
+	}
+
+	items, err := db.Items(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("Items: %v", err)
+	}
+	want := []int64{a.ID, cc.ID, b.ID, d.ID}
+	if len(items) != len(want) {
+		t.Fatalf("Items returned %d rows, want %d", len(items), len(want))
+	}
+	for i, id := range want {
+		if items[i].ID != id {
+			t.Fatalf("Items()[%d].ID = %d, want %d (full order: %+v)", i, items[i].ID, id, items)
+		}
+	}
+}
+
+// TestToggleDoesNotChangePosition is the property that makes a tick a pure
+// consequence of the ORDER BY rather than a data rewrite: unticking the item
+// again must bring it back to exactly where it was among the undone items,
+// which only holds if toggling never touched position in the first place.
+func TestToggleDoesNotChangePosition(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	item, err := db.CreateItem(ctx, c.ID, owner.ID, "Milk", "")
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	before := positionOf(t, db, item.ID)
+	if _, err := db.ToggleItem(ctx, item.ID); err != nil {
+		t.Fatalf("ToggleItem: %v", err)
+	}
+	after := positionOf(t, db, item.ID)
+	if before != after {
+		t.Fatalf("position changed on toggle: %d -> %d", before, after)
+	}
+}
+
+// TestCreateItemLandsAboveDoneItems shows why a new item's position — one
+// past the current maximum across the whole collection, done items included
+// — still ends up above any already-done item on the rendered list: Items'
+// done-first sort key wins regardless of the numeric position value.
+func TestCreateItemLandsAboveDoneItems(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	a, _ := db.CreateItem(ctx, c.ID, owner.ID, "A", "")
+	b, _ := db.CreateItem(ctx, c.ID, owner.ID, "B", "")
+	cc, _ := db.CreateItem(ctx, c.ID, owner.ID, "C", "")
+	if _, err := db.ToggleItem(ctx, b.ID); err != nil {
+		t.Fatalf("ToggleItem B: %v", err)
+	}
+
+	d, err := db.CreateItem(ctx, c.ID, owner.ID, "D", "")
+	if err != nil {
+		t.Fatalf("CreateItem D: %v", err)
+	}
+
+	items, err := db.Items(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("Items: %v", err)
+	}
+	want := []int64{a.ID, cc.ID, d.ID, b.ID}
+	if len(items) != len(want) {
+		t.Fatalf("Items returned %d rows, want %d", len(items), len(want))
+	}
+	for i, id := range want {
+		if items[i].ID != id {
+			t.Fatalf("Items()[%d].ID = %d, want %d (full order: %+v)", i, items[i].ID, id, items)
+		}
+	}
+}
+
+// TestReorderItemsAppliesGivenOrder is the basic drag-and-drop path: the
+// order passed in becomes the order Items reads back.
+func TestReorderItemsAppliesGivenOrder(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	a, _ := db.CreateItem(ctx, c.ID, owner.ID, "A", "")
+	b, _ := db.CreateItem(ctx, c.ID, owner.ID, "B", "")
+	cc, _ := db.CreateItem(ctx, c.ID, owner.ID, "C", "")
+
+	if err := db.ReorderItems(ctx, c.ID, []int64{cc.ID, a.ID, b.ID}); err != nil {
+		t.Fatalf("ReorderItems: %v", err)
+	}
+
+	items, err := db.Items(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("Items: %v", err)
+	}
+	want := []int64{cc.ID, a.ID, b.ID}
+	if len(items) != len(want) {
+		t.Fatalf("Items returned %d rows, want %d", len(items), len(want))
+	}
+	for i, id := range want {
+		if items[i].ID != id {
+			t.Fatalf("Items()[%d].ID = %d, want %d (full order: %+v)", i, items[i].ID, id, items)
+		}
+	}
+}
+
+// TestReorderItemsCannotMoveItemBetweenCollections is the security property:
+// an id smuggled in from a collection the caller does not control over must
+// not be adopted into the caller's collection. This mirrors the item-id
+// smuggling protection itemFor enforces in the web layer, but at the store
+// layer, where ReorderItems' WHERE clause is the only thing standing between
+// an arbitrary id and someone else's data.
+func TestReorderItemsCannotMoveItemBetweenCollections(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	ownerA, err := db.UserByEmail(ctx, "a@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail A: %v", err)
+	}
+	collA, err := db.CreateCollection(ctx, ownerA.ID, "A's list")
+	if err != nil {
+		t.Fatalf("CreateCollection A: %v", err)
+	}
+	itemA, err := db.CreateItem(ctx, collA.ID, ownerA.ID, "mine", "")
+	if err != nil {
+		t.Fatalf("CreateItem A: %v", err)
+	}
+
+	ownerB, err := db.UserByEmail(ctx, "b@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail B: %v", err)
+	}
+	collB, err := db.CreateCollection(ctx, ownerB.ID, "B's list")
+	if err != nil {
+		t.Fatalf("CreateCollection B: %v", err)
+	}
+	itemB, err := db.CreateItem(ctx, collB.ID, ownerB.ID, "theirs", "")
+	if err != nil {
+		t.Fatalf("CreateItem B: %v", err)
+	}
+
+	beforeA := positionOf(t, db, itemA.ID)
+	beforeB := positionOf(t, db, itemB.ID)
+
+	// Reorder collection A but pass B's item id. The WHERE id = ? AND
+	// collection_id = ? clause should match nothing for it, and the call
+	// must still succeed rather than erroring on the zero-row update.
+	if err := db.ReorderItems(ctx, collA.ID, []int64{itemB.ID}); err != nil {
+		t.Fatalf("ReorderItems with a foreign id: %v", err)
+	}
+
+	if got := positionOf(t, db, itemB.ID); got != beforeB {
+		t.Fatalf("B's item position changed via a reorder scoped to A's collection: %d -> %d", beforeB, got)
+	}
+	if got := positionOf(t, db, itemA.ID); got != beforeA {
+		t.Fatalf("A's item position changed even though it was not in the reorder list: %d -> %d", beforeA, got)
+	}
+
+	// B's collection is untouched — the item did not get pulled into A's.
+	itemsB, err := db.Items(ctx, collB.ID)
+	if err != nil {
+		t.Fatalf("Items B: %v", err)
+	}
+	if len(itemsB) != 1 || itemsB[0].ID != itemB.ID {
+		t.Fatalf("collection B's items changed: %+v", itemsB)
 	}
 }
 

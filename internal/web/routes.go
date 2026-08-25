@@ -36,6 +36,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /collections/{collection}/members/{user}", s.handleRemoveMember)
 
 	mux.HandleFunc("POST /collections/{collection}/items", s.handleCreateItem)
+	mux.HandleFunc("POST /collections/{collection}/items/reorder", s.handleReorderItems)
 	mux.HandleFunc("GET /collections/{collection}/items", s.handleItemsFragment)
 	mux.HandleFunc("GET /collections/{collection}/items/{item}", s.handleItem)
 	mux.HandleFunc("GET /collections/{collection}/items/{item}/edit", s.handleEditItem)
@@ -362,15 +363,23 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := s.store.CreateItem(r.Context(), c.ID, u.ID, title, body)
-	if err != nil {
+	if _, err := s.store.CreateItem(r.Context(), c.ID, u.ID, title, body); err != nil {
 		internalError(w, "handleCreateItem", err)
 		return
 	}
+	items, err := s.store.Items(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleCreateItem: Items", err)
+		return
+	}
 	origin := liveOrigin(r)
-	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "item", ID: item.ID, Action: "created", Origin: origin})
+	// A new item lands at the end of the undone group (see CreateItem in
+	// store.go), which can sit above existing done items — the form's old
+	// hx-swap="beforeend" against a single-row fragment would append it after
+	// those done rows instead, so the whole list is re-rendered here.
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "items", Origin: origin})
 	s.notifyIndexes(r, c, origin)
-	s.renderFragment(w, "item", itemCtx{Item: item, Collection: c})
+	s.renderFragment(w, "items", pageData{Collection: c, Items: items})
 }
 
 // handleItemsFragment re-renders the whole items list on its own, for
@@ -462,15 +471,84 @@ func (s *Server) handleToggleItem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	updated, err := s.store.ToggleItem(r.Context(), item.ID)
-	if err != nil {
+	if _, err := s.store.ToggleItem(r.Context(), item.ID); err != nil {
 		internalError(w, "handleToggleItem", err)
 		return
 	}
+	items, err := s.store.Items(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleToggleItem: Items", err)
+		return
+	}
 	origin := liveOrigin(r)
-	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "item", ID: updated.ID, Action: "updated", Origin: origin})
+	// A tick sinks the row below every undone item purely via Items' ORDER BY
+	// (see ToggleItem in store.go, which deliberately never writes position),
+	// so the single-row "item" fragment used by handleUpdateItem is not
+	// enough here — the row has to move in the DOM, not just change in place
+	// — and the whole list is re-rendered instead.
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "items", Origin: origin})
 	s.notifyIndexes(r, c, origin)
-	s.renderFragment(w, "item", itemCtx{Item: updated, Collection: c})
+	s.renderFragment(w, "items", pageData{Collection: c, Items: items})
+}
+
+// handleReorderItems applies a drag-and-drop reorder. Any member may call
+// this, the same as every other item mutation — see collectionFor's
+// needOwner=false.
+//
+// The order comes in as a comma-separated list of ids in the "order" form
+// value rather than as repeated form fields, because that is the shape a
+// single hidden input fed by the client's drag library produces without any
+// JS-side serialisation help.
+func (s *Server) handleReorderItems(w http.ResponseWriter, r *http.Request) {
+	_, c, ok := s.collectionFor(w, r, false)
+	if !ok {
+		return
+	}
+
+	raw := strings.TrimSpace(r.PostFormValue("order"))
+	if raw == "" {
+		badRequest(w, "order must not be empty")
+		return
+	}
+	parts := strings.Split(raw, ",")
+	// Bounds the transaction ReorderItems runs, in the same spirit as
+	// maxTitleLen and friends above: this is a household to-do list, and
+	// nothing legitimate ever drags a thousand rows at once. Not a security
+	// boundary, just keeping unusable input out of the database.
+	if len(parts) > 1000 {
+		badRequest(w, "too many items to reorder")
+		return
+	}
+	ids := make([]int64, len(parts))
+	for i, p := range parts {
+		id, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil {
+			badRequest(w, "order must be a comma-separated list of item ids")
+			return
+		}
+		ids[i] = id
+	}
+
+	if err := s.store.ReorderItems(r.Context(), c.ID, ids); err != nil {
+		internalError(w, "handleReorderItems", err)
+		return
+	}
+	items, err := s.store.Items(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleReorderItems: Items", err)
+		return
+	}
+	origin := liveOrigin(r)
+	// "items" rather than a per-item event: every id in the drag may have
+	// moved, not just one row, so there is no single item id to name.
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "items", Origin: origin})
+	s.notifyIndexes(r, c, origin)
+	// Render the fragment back to the actor rather than trusting the DOM
+	// order the drag left behind — ReorderItems silently skips ids that
+	// belong to another collection or no longer exist (see its comment in
+	// store.go), so the server's view of the new order is authoritative and
+	// may legitimately differ from what was dragged.
+	s.renderFragment(w, "items", pageData{Collection: c, Items: items})
 }
 
 func (s *Server) handleDeleteItem(w http.ResponseWriter, r *http.Request) {

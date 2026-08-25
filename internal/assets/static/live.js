@@ -47,16 +47,13 @@
   // page can use.
   function handle(ev) {
     switch (ev.kind) {
+      // Only a text edit arrives as a per-item event now. Creating, ticking
+      // and dragging can all move a row, so they publish "items" instead and
+      // re-fetch the list; keeping edits per-row is what lets a swap land
+      // without disturbing an edit form open elsewhere on the page.
       case "item":
         if (!collectionID) break;
         switch (ev.action) {
-          case "created":
-            // Items are ordered by id and new ids are always highest, so
-            // appending is correct without needing the row's position.
-            if (!itemRow(ev.id)) {
-              fetchItem(ev.id, { target: "#items", swap: "beforeend" });
-            }
-            break;
           case "updated": {
             const row = itemRow(ev.id);
             if (row && !row.querySelector("form")) {
@@ -68,6 +65,10 @@
             itemRow(ev.id)?.remove();
             break;
         }
+        break;
+
+      case "items":
+        refetchItems();
         break;
 
       case "members":
@@ -111,18 +112,26 @@
     }
   }
 
+  // Re-fetch the whole item list. Used for any change that can move a row
+  // rather than just alter one: a create, a tick (done items sort to the
+  // bottom), or someone else's drag. The open-form guard is what stops a
+  // colleague's tick from destroying an edit this tab has in progress; the
+  // list stays stale only until that edit is saved or cancelled.
+  function refetchItems() {
+    if (!collectionID || itemsHasOpenForm()) return;
+    htmx.ajax("GET", "/collections/" + collectionID + "/items", {
+      target: "#items",
+      swap: "outerHTML",
+    });
+  }
+
   // Re-fetch everything this page shows. Used on (re)connect so a missed
   // event — one dropped as a slow consumer, or one that happened while the
   // connection was down — can't leave the page permanently stale; the next
   // successful open just re-derives truth from scratch.
   function resync() {
     if (collectionID) {
-      if (!itemsHasOpenForm()) {
-        htmx.ajax("GET", "/collections/" + collectionID + "/items", {
-          target: "#items",
-          swap: "outerHTML",
-        });
-      }
+      refetchItems();
       htmx.ajax("GET", "/collections/" + collectionID + "/members", {
         target: "#members",
         swap: "outerHTML",

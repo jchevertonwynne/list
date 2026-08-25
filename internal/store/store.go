@@ -64,6 +64,16 @@ var migrations = []string{
 	// Items is a fan-out table an order of magnitude bigger than the others;
 	// Items and CollectionsForUser both filter on collection_id.
 	`CREATE INDEX idx_items_collection ON items (collection_id)`,
+	// Manual ordering: undone items in drag order, then done items in drag
+	// order. See the ORDER BY in Items for the full three-term sort this
+	// column participates in.
+	`ALTER TABLE items ADD COLUMN position INTEGER NOT NULL DEFAULT 0`,
+	// Every row added before this migration would otherwise share position 0
+	// and fall back entirely to the id tiebreak in the ORDER BY below, which
+	// happens to reproduce today's order only by luck (ids already increase
+	// in creation order). Seeding position from id makes that existing order
+	// explicit and stable instead of an accident of the tiebreak.
+	`UPDATE items SET position = id`,
 }
 
 // Open opens (creating if necessary) the SQLite file at path and brings its
@@ -336,6 +346,15 @@ func (d *DB) DeleteCollection(ctx context.Context, id int64) error {
 
 // Items lists a collection's items with the creator's email resolved by
 // join, so rendering a list of N items costs one query rather than N+1.
+//
+// ORDER BY done ASC, position ASC, id ASC: undone items first in their manual
+// drag order, then done items in their manual drag order. Ticking an item
+// sinks it below every undone item purely as a consequence of this sort —
+// see ToggleItem, which deliberately never touches position — and unticking
+// it surfaces it back where it was among the undone items, again with no
+// write. id is the final tiebreak for rows that still share a position (e.g.
+// two items both backfilled to the same value, which cannot happen after the
+// migration but is cheap insurance against it happening some other way).
 func (d *DB) Items(ctx context.Context, collectionID int64) ([]ItemView, error) {
 	return withSpan(ctx, "Items", func(ctx context.Context) ([]ItemView, error) {
 		rows, err := d.db.QueryContext(ctx, `
@@ -343,7 +362,7 @@ func (d *DB) Items(ctx context.Context, collectionID int64) ([]ItemView, error) 
 			FROM items i
 			JOIN users u ON u.id = i.creator_id
 			WHERE i.collection_id = ?
-			ORDER BY i.id
+			ORDER BY i.done ASC, i.position ASC, i.id ASC
 		`, collectionID)
 		if err != nil {
 			return nil, fmt.Errorf("list items for collection %d: %w", collectionID, err)
@@ -370,13 +389,19 @@ func (d *DB) Items(ctx context.Context, collectionID int64) ([]ItemView, error) 
 
 // CreateItem inserts a new item and re-reads it through Item so the caller
 // gets the creator's email back without duplicating that join here.
+//
+// position is one past the current maximum within the collection, which
+// lands the new item at the end of the undone group — the subquery scopes
+// MAX(position) to collection_id rather than the whole table, or a
+// collection that started later than another would have its first item jump
+// ahead of everything in the older one.
 func (d *DB) CreateItem(ctx context.Context, collectionID, creatorID int64, title, body string) (ItemView, error) {
 	return withSpan(ctx, "CreateItem", func(ctx context.Context) (ItemView, error) {
 		now := time.Now().Unix()
 		res, err := d.db.ExecContext(ctx, `
-			INSERT INTO items (collection_id, title, body, creator_id, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, collectionID, title, body, creatorID, now, now)
+			INSERT INTO items (collection_id, title, body, creator_id, created_at, updated_at, position)
+			VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM items WHERE collection_id = ?))
+		`, collectionID, title, body, creatorID, now, now, collectionID)
 		if err != nil {
 			return ItemView{}, fmt.Errorf("insert item: %w", err)
 		}
@@ -429,6 +454,13 @@ func (d *DB) UpdateItem(ctx context.Context, id int64, title, body string) (Item
 // ToggleItem flips done. NOT done reads as a boolean flip in SQLite because
 // the column is INTEGER NOT NULL DEFAULT 0, so it is always exactly 0 or 1
 // going in.
+//
+// This deliberately never touches position. Items' ORDER BY (done ASC,
+// position ASC, id ASC) already sinks a done item below every undone one and
+// resurfaces it in its old spot the moment it is unticked again — rewriting
+// position on every toggle would be redundant work that also throws away the
+// place the item held among its own group, so an untick would land it
+// somewhere new instead of back where it was.
 func (d *DB) ToggleItem(ctx context.Context, id int64) (ItemView, error) {
 	return withSpan(ctx, "ToggleItem", func(ctx context.Context) (ItemView, error) {
 		res, err := d.db.ExecContext(ctx, `UPDATE items SET done = NOT done, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
@@ -450,6 +482,43 @@ func (d *DB) DeleteItem(ctx context.Context, id int64) error {
 			return fmt.Errorf("delete item %d: %w", id, err)
 		}
 		return notFoundIfNoRows(res, "item %d", id)
+	})
+}
+
+// ReorderItems assigns positions to ids in the order given: the first id
+// gets position 0, the second 1, and so on. All updates run in one
+// transaction so a reorder is atomic from any reader's point of view — never
+// half the drag applied.
+//
+// Every UPDATE is scoped WHERE id = ? AND collection_id = ?, and that
+// scoping is the security boundary, not a redundant belt-and-braces check:
+// an id smuggled in from another collection matches zero rows and is
+// silently skipped rather than being adopted into this collection's order.
+// A zero-row UPDATE is not surfaced as an error, unlike notFoundIfNoRows
+// elsewhere in this file — an id that stopped existing mid-drag because of a
+// concurrent delete is an ordinary race, not a failure worth aborting the
+// whole reorder over, and the deleted item was never going to be seen out of
+// order again anyway.
+func (d *DB) ReorderItems(ctx context.Context, collectionID int64, ids []int64) error {
+	return withSpanErr(ctx, "ReorderItems", func(ctx context.Context) error {
+		tx, err := d.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin reorder items in collection %d: %w", collectionID, err)
+		}
+		defer tx.Rollback()
+
+		for position, id := range ids {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE items SET position = ? WHERE id = ? AND collection_id = ?
+			`, position, id, collectionID); err != nil {
+				return fmt.Errorf("reorder item %d in collection %d: %w", id, collectionID, err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit reorder items in collection %d: %w", collectionID, err)
+		}
+		return nil
 	})
 }
 

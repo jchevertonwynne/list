@@ -6,20 +6,25 @@
 */}}
 
 {{/* item renders one row. Context is web.itemCtx: .Item and .Collection.
-     The row is its own hx-target, so every action on it swaps just itself. */}}
+
+     Editing and deleting target the row itself, because neither moves it.
+     Ticking targets the whole list instead: done items sort to the bottom
+     (see store.Items), so a tick relocates the row and swapping it in place
+     would leave it rendered where it no longer belongs. */}}
 {{define "item"}}
-<li class="item{{if .Item.Done}} done{{end}}" id="item-{{.Item.ID}}">
+<li class="item{{if .Item.Done}} done{{end}}" id="item-{{.Item.ID}}" data-item-id="{{.Item.ID}}">
+  <i class="drag-handle" aria-hidden="true">drag_indicator</i>
   <label class="checkbox">
     <input type="checkbox" {{if .Item.Done}}checked{{end}}
            hx-post="/collections/{{.Collection.ID}}/items/{{.Item.ID}}/toggle"
-           hx-target="#item-{{.Item.ID}}"
+           hx-target="#items"
            hx-swap="outerHTML">
     <span></span>
   </label>
   <div class="max">
     <div class="item-title">{{.Item.Title}}</div>
     {{if .Item.Body}}<div class="item-body small-text">{{.Item.Body}}</div>{{end}}
-    <div class="small-text secondary-text">added by {{.Item.CreatorEmail}}</div>
+    <div class="item-meta small-text secondary-text">added by {{.Item.CreatorEmail}}</div>
   </div>
   <button class="circle transparent"
           hx-get="/collections/{{.Collection.ID}}/items/{{.Item.ID}}/edit"
@@ -48,11 +53,11 @@
         hx-target="#item-{{.Item.ID}}"
         hx-swap="outerHTML">
     <div class="field label border">
-      <input type="text" name="title" value="{{.Item.Title}}" maxlength="200" required>
+      <input type="text" name="title" value="{{.Item.Title}}" maxlength="200" required placeholder=" ">
       <label>Title</label>
     </div>
     <div class="field textarea label border">
-      <textarea name="body" maxlength="4000">{{.Item.Body}}</textarea>
+      <textarea name="body" maxlength="4000" placeholder=" ">{{.Item.Body}}</textarea>
       <label>Notes</label>
     </div>
     <nav class="right-align">
@@ -93,9 +98,11 @@
 {{/* items is the whole item list for a collection page. It exists as its own
      fragment (rather than living inline in collection.html) so a live-update
      re-sync after a reconnect, and the full page render, produce identical
-     markup. Context is web.pageData. */}}
+     markup. It is also what create, toggle and reorder swap in, since each of
+     those can move a row rather than just change one. Context is
+     web.pageData. */}}
 {{define "items"}}
-<ul class="list items border" id="items">
+<ul class="list items border" id="items" data-collection="{{.Collection.ID}}">
   {{$c := .Collection}}
   {{range .Items}}
     {{template "item" (itemCtx .  $c)}}
@@ -117,11 +124,18 @@
   <li>
     <div class="max">
       <a href="/collections/{{.ID}}" class="bold">{{.Name}}</a>
-      <div class="small-text secondary-text">
+      <div class="collection-meta small-text secondary-text">
         {{.DoneCount}} of {{.ItemCount}} done &middot; owned by {{.OwnerEmail}}
       </div>
+      {{/* A bar rather than Beer's .circle ring: at this size the ring reads
+           as a faint outline with a dot on it, which looks like a broken
+           spinner rather than progress. max falls back to 1 for an empty
+           collection so the element still renders at zero instead of being
+           undefined. */}}
+      <progress class="collection-progress"
+                value="{{.DoneCount}}"
+                max="{{if .ItemCount}}{{.ItemCount}}{{else}}1{{end}}"></progress>
     </div>
-    <progress class="circle" value="{{.DoneCount}}" max="{{if .ItemCount}}{{.ItemCount}}{{else}}1{{end}}"></progress>
   </li>
   {{end}}
 </ul>

@@ -33,6 +33,9 @@ type Store interface {
 	UpdateItem(ctx context.Context, id int64, title, body string) (store.ItemView, error)
 	ToggleItem(ctx context.Context, id int64) (store.ItemView, error)
 	DeleteItem(ctx context.Context, id int64) error
+	// ReorderItems assigns positions to ids in the order given, scoped to
+	// collectionID so an id from another collection cannot be smuggled in.
+	ReorderItems(ctx context.Context, collectionID int64, ids []int64) error
 
 	Members(ctx context.Context, collectionID int64) ([]store.User, error)
 	AddMember(ctx context.Context, collectionID int64, email string) (store.User, error)
