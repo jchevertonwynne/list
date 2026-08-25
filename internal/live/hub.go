@@ -47,7 +47,7 @@ type Event struct {
 	Kind       string `json:"kind"`                 // "item" | "members" | "collection" | "collections" | "access"
 	ID         int64  `json:"id,omitempty"`         // item id, for Kind=="item"
 	Collection int64  `json:"collection,omitempty"` // for Kind=="access"
-	Action     string `json:"action,omitempty"`     // "created"|"updated"|"deleted"|"renamed"|"revoked"
+	Action     string `json:"action,omitempty"`     // "created"|"updated"|"deleted"|"renamed"|"revoked"|"cover"
 	Origin     string `json:"origin,omitempty"`     // originating tab id, so a browser can ignore its own echo
 }
 

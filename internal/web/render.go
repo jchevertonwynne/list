@@ -27,6 +27,17 @@ type pageData struct {
 	Members     []store.User
 	IsOwner     bool
 	Error       string
+
+	// CoverETag, CoverWidth and CoverHeight describe a collection's cover for
+	// the banner <img> on collection.html. They live here rather than on
+	// store.Collection for the same reason itemCtx exists above: a rendering
+	// concern — what the template needs to draw a banner without shifting the
+	// page — does not belong on a store type. An empty CoverETag means "no
+	// cover", the ordinary case for most collections, not an error; see
+	// store.CollectionImageETag.
+	CoverETag   string
+	CoverWidth  int
+	CoverHeight int
 }
 
 // pages holds one fully-parsed template set per page.

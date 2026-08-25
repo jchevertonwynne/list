@@ -42,6 +42,7 @@ integers anyone can type; nothing else stands between them and the data.
 |---|---|---|---|
 | see the collection | yes | yes | **404** |
 | add, edit, delete, tick items | yes | yes | 404 |
+| set, replace or remove the cover | yes | yes | 404 |
 | rename or delete the collection | yes | 403 | 404 |
 | invite and remove people | yes | 403 | 404 |
 
@@ -128,6 +129,92 @@ path is relative — split them up and every icon renders as the literal word
 This matters beyond neatness. It is a private app, and a page that fetches a
 font from a third party hands that third party the IP of everyone who opens
 it.
+
+## Cover images
+
+Any member may paste or pick one photo per collection, shown as a banner at
+the top of that collection's page — see
+[Who can do what](#who-can-do-what) above; there is no owner-only carve-out
+here, the same as any other item-level action. There is no thumbnail on the
+index list, deliberately: that keeps `CollectionsForUser` untouched and
+keeps covers off the index's live-update path entirely.
+
+**Storage.** The bytes live in SQLite, in their own `collection_images`
+table, not a column on `collections`. `CollectionsForUser` and `Items` both
+`SELECT` every column of the rows they touch on every page load, so a blob
+column on `collections` would push those rows onto overflow pages and drag
+image bytes through the page cache just to render a list of names.
+`collection_id` is the table's sole primary key, which expresses "one cover
+per collection" in the schema itself rather than in handler discipline, and
+turns a replace into a plain `INSERT ... ON CONFLICT DO UPDATE`. Deleting the
+collection reclaims its cover with no extra code, via the same
+`ON DELETE CASCADE` and `foreign_keys(1)` pragma that already covers items
+and memberships. Storing the bytes in SQLite, rather than as files on the PVC,
+also keeps the [backup story](#backups) intact: scale to zero, copy
+`list.db`. A file on disk would need its own cleanup path, and could orphan
+on a crash between the database write and the unlink.
+
+**Uploading with no writable `/tmp`.** The container is `FROM scratch` with
+`readOnlyRootFilesystem: true`, so there is nowhere for anything to spill to.
+That rules out `ParseMultipartForm`/`FormFile`: past its memory limit,
+`mime/multipart`'s `ReadForm` spills the remainder to `os.CreateTemp`, and a
+cover here is capped at only a couple of megabytes on a Pi with no writable
+filesystem to catch that write. So the handler reads the request with
+`r.MultipartReader()` instead, takes the single part named `cover`, and
+copies it into memory through a length-limited reader. The streaming reader
+has no disk-spill code path at all — "nothing ever spills" is a property of
+which function got called, not of a byte constant that has to stay in sync
+with reality. A later "simplification" back to `r.FormFile` would silently
+reintroduce the crash, and worse, would silently fall back to Go's 32MB
+default the moment nobody remembered to pass a limit — quietly
+disconnecting the cap from the code that is supposed to enforce it.
+
+**Serving: content-addressed and immutable.**
+`GET /collections/{id}/cover/{etag}` serves the bytes. The etag in the URL is a
+SHA-256 prefix of the stored bytes, and the handler 404s on any mismatch —
+which is what makes `Cache-Control: private, max-age=31536000, immutable`
+true rather than aspirational: the URL cannot go stale under a client that
+already has it, because a change in the bytes is a change in the URL. That
+header is the one named exception to a rule set everywhere else:
+`authenticate` sets `Cache-Control: no-store` as the *default* on every
+response, because an authenticated page is specific to whoever asked for it
+and must never sit in a shared cache — Cloudflare's edge in particular,
+which sits in front of this app. A cover response is the one thing allowed
+to override that default, through a helper named `cacheImmutable`, and only
+because the URL is content-addressed and the caller has already been
+through the same membership check as every other collection route. `private`
+in that header is load-bearing, not decorative: `public` would let
+Cloudflare's edge cache a member-only image for anyone behind it to
+receive. Content-Type comes from the server's own record of what it decided
+to store, never from anything the client claimed, and ships alongside
+`X-Content-Type-Options: nosniff`.
+
+**Nothing survives the round trip.** A phone photo carries EXIF, and EXIF
+carries GPS coordinates. The browser's own canvas step already discards all
+of it before upload (see `cover.js`), but the client is not a trust
+boundary — anyone with a session can `curl` a `PUT` straight past it with an
+untouched photo. So the server decodes every upload and re-encodes it with
+`image/jpeg` before it is ever written to disk, and Go's JPEG encoder emits
+**zero** `APPn` segments of any kind — only SOI, DQT, SOF0, DHT, SOS and
+EOI. EXIF, an ICC profile, XMP, an embedded thumbnail: none of it can reach
+the database, regardless of what arrived, because the format the server
+writes has no field left to carry it in. This sits next to [No external
+requests](#no-external-requests) above for the same reason: both are about
+what this app refuses to let leak, one outbound and one in an uploaded
+file.
+
+The decode step is guarded before it runs, not just after:
+`image.DecodeConfig` reads the header first, and a request is rejected if it
+claims an edge over 8000px or more than 40 megapixels, before `image.Decode`
+ever runs. A two-megabyte JPEG can quite legally declare a 30000×30000
+image, and `image.Decode` allocates roughly `width * height * 4` bytes for
+whatever the header claims — a decompression bomb is a real way to get a Pi
+OOM-killed, and the byte cap on the request body alone does not bound that.
+Only PNG and JPEG are accepted in the first place: the server re-encodes
+everything, and the stdlib has no encoder for WebP or GIF, so accepting
+either would mean shipping it back out unstripped. SVG falls out for free —
+it sniffs as `text/xml`, never as an image — which matters because an SVG
+served from this origin would execute script *in* this origin.
 
 ## Live updates
 
@@ -220,6 +307,8 @@ Two things worth knowing if you're touching this next:
 | `GET /collections/{id}/members` | The `#members` fragment, rendered per viewer |
 | `GET/POST/PUT/DELETE /collections/{id}/items/...` | Any member |
 | `GET /collections/{id}/items` | The `#items` fragment, re-fetched on a live update |
+| `GET /collections/{id}/cover/{etag}` | The banner image, content-addressed and cached hard — see [Cover images](#cover-images) |
+| `PUT /collections/{id}/cover` · `DELETE /.../cover` | Set/replace or remove the cover. Any member |
 | `GET /live` | SSE stream for the index page — see [Live updates](#live-updates) |
 | `GET /collections/{id}/live` | SSE stream for a collection page |
 | `GET /healthz` | Liveness. No auth, no database |
@@ -266,3 +355,15 @@ ssh jcw@jcwpi 'sudo find /var/lib/rancher/k3s/storage -name list.db'
 
 Copy it while the Deployment is scaled to zero. WAL mode means a live copy of
 `list.db` alone can miss recent commits sitting in `list.db-wal`.
+
+`list.db` now grows with cover image data, not just rows of text, and
+`list.db-wal` will routinely run to several megabytes: upserting a
+few-hundred-kilobyte blob rewrites that row's overflow pages, and WAL mode
+defers folding those pages back into the main file until a checkpoint. A
+removed cover frees its pages, but SQLite never hands them back to the
+filesystem on its own — there is no `VACUUM` anywhere in this codebase, and
+`auto_vacuum` cannot be turned on for a file that already exists without
+running one, since it only takes effect on the next database created from
+scratch. So `list.db` only grows over time, even as covers are replaced and
+removed; that is an accepted trade-off for a household list on a Pi with
+disk to spare, not an oversight.

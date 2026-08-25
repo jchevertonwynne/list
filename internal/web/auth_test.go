@@ -90,6 +90,22 @@ func (f *fakeStore) RemoveMember(ctx context.Context, collectionID, userID int64
 	return nil
 }
 
+func (f *fakeStore) SetCollectionImage(ctx context.Context, collectionID int64, mime string, data []byte, etag string, width, height int) error {
+	return nil
+}
+
+func (f *fakeStore) CollectionImage(ctx context.Context, collectionID int64) (store.CollectionImage, error) {
+	return store.CollectionImage{}, nil
+}
+
+func (f *fakeStore) CollectionImageETag(ctx context.Context, collectionID int64) (string, int, int, error) {
+	return "", 0, 0, nil
+}
+
+func (f *fakeStore) DeleteCollectionImage(ctx context.Context, collectionID int64) error {
+	return nil
+}
+
 // downstreamSpy is the next handler in the chain. It records whether it ran
 // at all — the security property under test is as much "did not call next"
 // as it is "returned the right status" — and, when it does run, what

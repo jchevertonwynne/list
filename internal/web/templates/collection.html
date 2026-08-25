@@ -6,9 +6,41 @@
 {{define "bodyattrs"}}data-live="/collections/{{.Collection.ID}}/live" data-collection="{{.Collection.ID}}"{{end}}
 
 {{define "content"}}
+{{if .CoverETag}}
+{{/* width/height are what stop the page shifting as the image loads — see
+     the CSS on .cover-banner in layout.html for the fixed-aspect-ratio half
+     of that same guarantee. */}}
+<img class="cover-banner round"
+     src="/collections/{{.Collection.ID}}/cover/{{.CoverETag}}"
+     width="{{.CoverWidth}}" height="{{.CoverHeight}}" alt="">
+{{end}}
+
 <nav>
   <a href="/" class="button circle transparent"><i>arrow_back</i></a>
   <h5 class="max">{{.Collection.Name}}</h5>
+</nav>
+
+{{/* The hidden form is not decoration: cover.js's htmx.ajax call passes it as
+     "source" so the multipart branch in htmx's own hx-encoding check fires —
+     see cover.js for why a plain {values:{cover: blob}} call would silently
+     urlencode the blob instead. The file input is the picker fallback for a
+     phone, since iOS Safari will not reliably hand a clipboard image to a
+     paste listener outside a contenteditable. Removal needs no JS at all:
+     htmx's own DELETE sends no body in this version, and the handler is
+     idempotent, so a plain hx-delete button is all that control needs. */}}
+<form id="cover-form" hx-encoding="multipart/form-data" hidden></form>
+<input type="file" id="cover-input" accept="image/*" hidden>
+<nav class="right-align">
+  <button type="button" class="transparent" id="cover-pick">
+    <i>add_photo_alternate</i> {{if .CoverETag}}Change cover{{else}}Add cover{{end}}
+  </button>
+  {{if .CoverETag}}
+  <button class="transparent error"
+          hx-delete="/collections/{{.Collection.ID}}/cover"
+          hx-confirm="Remove this collection's cover?">
+    <i>hide_image</i> Remove cover
+  </button>
+  {{end}}
 </nav>
 
 <article class="border round">

@@ -40,6 +40,13 @@ type Store interface {
 	Members(ctx context.Context, collectionID int64) ([]store.User, error)
 	AddMember(ctx context.Context, collectionID int64, email string) (store.User, error)
 	RemoveMember(ctx context.Context, collectionID, userID int64) error
+
+	SetCollectionImage(ctx context.Context, collectionID int64, mime string, data []byte, etag string, width, height int) error
+	CollectionImage(ctx context.Context, collectionID int64) (store.CollectionImage, error)
+	// CollectionImageETag omits the blob column; see its comment in store.go
+	// for why the collection page uses it and the serving path below does not.
+	CollectionImageETag(ctx context.Context, collectionID int64) (etag string, width, height int, err error)
+	DeleteCollectionImage(ctx context.Context, collectionID int64) error
 }
 
 // Server holds the dependencies every handler needs.
@@ -85,8 +92,9 @@ func (s *Server) Handler() http.Handler {
 	s.routes(app)
 
 	// authenticate outermost so that every response — including one the CSRF
-	// guard rejects — carries Cache-Control: no-store, and so that the guard's
-	// log lines can name the user they came from.
+	// guard rejects — carries Cache-Control: no-store by default (the one
+	// named override is cacheImmutable, see routes.go), and so that the
+	// guard's log lines can name the user they came from.
 	mux.Handle("/", s.authenticate(guardCSRF(app)))
 
 	// Instrument wraps the whole mux, not just app: /healthz and /metrics

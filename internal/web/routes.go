@@ -1,7 +1,14 @@
 package web
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"image"
+	"image/jpeg"
+	_ "image/png" // decoder only; every upload is re-encoded to jpeg on the way out
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -20,6 +27,12 @@ const (
 	maxTitleLen = 200
 	maxBodyLen  = 4000
 	maxEmailLen = 320
+	// maxCoverBytes bounds a cover upload, both as the http.MaxBytesReader
+	// limit on the whole request body and as the check on the single
+	// multipart part read out of it (see handleUploadCollectionCover). A
+	// couple of MB comfortably covers a phone photo re-encoded to JPEG by the
+	// client, on a Pi with no writable /tmp to spill a larger one into.
+	maxCoverBytes = 2 << 20 // 2 MiB
 )
 
 func (s *Server) routes(mux *http.ServeMux) {
@@ -30,6 +43,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /collections/{collection}", s.handleCollection)
 	mux.HandleFunc("POST /collections/{collection}/rename", s.handleRenameCollection)
 	mux.HandleFunc("DELETE /collections/{collection}", s.handleDeleteCollection)
+
+	// Any member, not just the owner, may set, replace or remove a cover —
+	// the same bar as every item mutation, and a deliberate choice recorded
+	// in the plan rather than an oversight: a shared household list has no
+	// natural reason to make this owner-only.
+	mux.HandleFunc("GET /collections/{collection}/cover/{etag}", s.handleCollectionCover)
+	mux.HandleFunc("PUT /collections/{collection}/cover", s.handleUploadCollectionCover)
+	mux.HandleFunc("DELETE /collections/{collection}/cover", s.handleDeleteCollectionCover)
 
 	mux.HandleFunc("POST /collections/{collection}/members", s.handleAddMember)
 	mux.HandleFunc("GET /collections/{collection}/members", s.handleMembersFragment)
@@ -62,6 +83,32 @@ func badRequest(w http.ResponseWriter, msg string) {
 func internalError(w http.ResponseWriter, what string, err error) {
 	log.Printf("%s: %v", what, err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// cacheImmutable overrides authenticate's default Cache-Control: no-store for
+// the one response class where that default is actively wrong: a collection
+// cover, served from a content-addressed URL — handleCollectionCover 404s on
+// any {etag} that does not match what is stored, which is what makes calling
+// this response immutable true rather than aspirational. Caching it hard
+// turns a per-page-load image fetch from "one INSERT ... ON CONFLICT DO
+// NOTHING write transaction on single-writer SQLite" (UserByEmail, run by
+// authenticate on every request) into one fetch per version, ever.
+//
+// This is safe only with all three of the following true, so treat any of
+// them changing as a reason to reconsider this call, not just the header:
+//   - the URL changes whenever the bytes do, so there is nothing to
+//     revalidate and no cache-busting query param to manage;
+//   - the caller has already been through collectionFor, so only a current
+//     member of the collection ever reaches this response;
+//   - "private" is load-bearing, not decorative: Cloudflare's edge sits in
+//     front of this origin, and "public" would let that edge store a
+//     member-only image for anyone behind it to receive.
+//
+// A revalidating scheme (no-cache plus ETag) was rejected: it would still
+// cost a full authenticated round trip — that same UserByEmail write — on
+// every page load, forever, even when the answer is always 304.
+func cacheImmutable(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 }
 
 // field pulls one trimmed form value and length-checks it.
@@ -172,13 +219,25 @@ func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "handleCollection: Members", err)
 		return
 	}
+	// An empty etag means this collection has no cover, which is the ordinary
+	// case, not an error — see CollectionImageETag. Using it rather than
+	// CollectionImage keeps image bytes off this, the hottest read path a
+	// collection has.
+	coverETag, coverWidth, coverHeight, err := s.store.CollectionImageETag(r.Context(), c.ID)
+	if err != nil {
+		internalError(w, "handleCollection: CollectionImageETag", err)
+		return
+	}
 	s.render(w, "collection.html", pageData{
-		UserEmail:  u.Email,
-		Title:      c.Name,
-		Collection: c,
-		Items:      items,
-		Members:    members,
-		IsOwner:    c.OwnerID == u.ID,
+		UserEmail:   u.Email,
+		Title:       c.Name,
+		Collection:  c,
+		Items:       items,
+		Members:     members,
+		IsOwner:     c.OwnerID == u.ID,
+		CoverETag:   coverETag,
+		CoverWidth:  coverWidth,
+		CoverHeight: coverHeight,
 	})
 }
 
@@ -238,6 +297,215 @@ func (s *Server) handleDeleteCollection(w http.ResponseWriter, r *http.Request) 
 	s.live.Evict(live.CollectionTopic(c.ID), 0)
 
 	w.Header().Set("HX-Redirect", "/")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ------------------------------------------------------------------- covers
+
+// handleCollectionCover serves a collection's cover image. It is deliberately
+// simple: the {etag} path segment is compared against what is actually
+// stored, and a mismatch is a 404 rather than a redirect to the current
+// one — that comparison, not the Cache-Control header below, is what makes
+// calling this URL immutable true rather than merely convenient. It also
+// covers a cover reached through the wrong collection's URL: that
+// collection's own stored etag, whatever it is, is not going to be the one in
+// the path either.
+func (s *Server) handleCollectionCover(w http.ResponseWriter, r *http.Request) {
+	_, c, ok := s.collectionFor(w, r, false)
+	if !ok {
+		return
+	}
+	img, err := s.store.CollectionImage(r.Context(), c.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		internalError(w, "handleCollectionCover: CollectionImage", err)
+		return
+	}
+	if r.PathValue("etag") != img.ETag {
+		http.NotFound(w, r)
+		return
+	}
+
+	// The type served is the server's own record of what was stored, never
+	// anything a client supplied — see the upload path below, which sniffs
+	// and then unconditionally re-encodes to image/jpeg before this column is
+	// ever written.
+	w.Header().Set("Content-Type", img.Mime)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Only on this, the success path: setting it before either return above
+	// would ship a year-long cacheable directive on a 404 body.
+	cacheImmutable(w)
+	w.Write(img.Bytes)
+}
+
+// maxCoverEdge and maxCoverPixels bound what image.DecodeConfig is allowed to
+// report before handleUploadCollectionCover attempts a full decode.
+// image.Decode allocates roughly width*height*4 bytes for whatever the
+// header claims, so a two-megabyte file that merely declares a 30000x30000
+// header is a real denial-of-service on a Pi — maxCoverBytes bounds the file
+// on the wire, not the lie inside it.
+const (
+	maxCoverEdge   = 8000
+	maxCoverPixels = 40_000_000 // ~40 megapixels; well past any real cover photo
+)
+
+// handleUploadCollectionCover accepts one image as a multipart part named
+// "cover", decodes it, and re-encodes it as JPEG before storing it. The
+// re-encode is the metadata strip described below, not a side effect of it.
+func (s *Server) handleUploadCollectionCover(w http.ResponseWriter, r *http.Request) {
+	_, c, ok := s.collectionFor(w, r, false)
+	if !ok {
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxCoverBytes)
+
+	// r.MultipartReader() streams the part straight off the connection into
+	// the buffer below — deliberately never ParseMultipartForm or FormFile.
+	// ReadForm (mime/multipart/formdata.go) spills anything past its memory
+	// limit to os.CreateTemp, and this container has readOnlyRootFilesystem
+	// with no /tmp to spill into. The streaming reader has no such code path
+	// at all, which is the point: "nothing ever spills" becomes a property of
+	// which function is called, not a constant someone has to remember to
+	// keep in sync. A later "simplification" to r.FormFile would silently
+	// reintroduce that crash — and it falls back to Go's 32MB default when no
+	// limit is set, so it would also quietly stop depending on maxCoverBytes
+	// at all.
+	mr, err := r.MultipartReader()
+	if err != nil {
+		badRequest(w, "expected a multipart cover upload")
+		return
+	}
+	part, err := mr.NextPart()
+	if err != nil {
+		badRequest(w, "expected a multipart cover upload")
+		return
+	}
+	defer part.Close()
+	if part.FormName() != "cover" {
+		badRequest(w, `expected a form field named "cover"`)
+		return
+	}
+
+	// Reading cap+1 bytes off the part is how an oversized upload is
+	// detected: if the copy actually reaches maxCoverBytes+1, the part alone
+	// was too big. The MaxBytesReader above is the backstop for the same
+	// condition arriving a different way (the request body as a whole,
+	// multipart overhead included, crossing the cap first) — its error also
+	// means "too large", so both are answered with 413 below rather than one
+	// producing a generic 400 depending on exactly where the cap fell.
+	var buf bytes.Buffer
+	n, err := io.Copy(&buf, io.LimitReader(part, maxCoverBytes+1))
+	if err != nil {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			http.Error(w, "image too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		badRequest(w, "could not read the uploaded image")
+		return
+	}
+	if n > maxCoverBytes {
+		http.Error(w, "image too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	data := buf.Bytes()
+
+	// A cheap early reject before any decode. png and jpeg are the only
+	// formats accepted: the server re-encodes every upload (see below), and
+	// the stdlib has no encoder for webp or gif, so accepting either would
+	// mean shipping it back out unstripped. svg falls out for free — it
+	// sniffs as text/xml, never as an image — which matters because an svg
+	// served from this origin would execute script in this origin.
+	switch http.DetectContentType(data) {
+	case "image/png", "image/jpeg":
+	default:
+		badRequest(w, "only PNG and JPEG images are accepted")
+		return
+	}
+
+	// DecodeConfig reads only the header, before any full decode, so an
+	// image that merely declares absurd dimensions is rejected here rather
+	// than in image.Decode below — see the comment on maxCoverEdge above for
+	// why that ordering matters.
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		badRequest(w, "that does not look like a valid image")
+		return
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 ||
+		cfg.Width > maxCoverEdge || cfg.Height > maxCoverEdge ||
+		cfg.Width*cfg.Height > maxCoverPixels {
+		badRequest(w, "that image's dimensions are too large")
+		return
+	}
+
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		badRequest(w, "that does not look like a valid image")
+		return
+	}
+
+	// This is the actual enforcement point for metadata stripping. Go's jpeg
+	// encoder emits only SOI, DQT, SOF0, DHT, SOS and EOI — zero APPn
+	// segments of any kind — so EXIF, GPS, an ICC profile, XMP and any
+	// embedded thumbnail cannot survive this call regardless of what arrived.
+	// The browser's own canvas step already discards all of it, but the
+	// client is not a trust boundary: anyone with a session can curl a PUT
+	// with an untouched phone photo.
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, decoded, nil); err != nil {
+		internalError(w, "handleUploadCollectionCover: jpeg.Encode", err)
+		return
+	}
+	encoded := out.Bytes()
+
+	// The etag is derived from the re-encoded bytes, not the upload: those
+	// are what actually end up stored and served, so they are what the URL
+	// must address. A truncated hex prefix keeps the URL short; collision
+	// risk over one collection's history of covers is not a real concern at
+	// this length.
+	sum := sha256.Sum256(encoded)
+	etag := hex.EncodeToString(sum[:8])
+
+	bounds := decoded.Bounds()
+	if err := s.store.SetCollectionImage(r.Context(), c.ID, "image/jpeg", encoded, etag, bounds.Dx(), bounds.Dy()); err != nil {
+		internalError(w, "handleUploadCollectionCover: SetCollectionImage", err)
+		return
+	}
+
+	origin := liveOrigin(r)
+	// Not notifyIndexes: the cover is a collection-page banner only, never
+	// shown on the index, so nothing there needs to know it changed.
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "collection", Action: "cover", Origin: origin})
+
+	// Matches handleRenameCollection: the banner's <img> src carries the new
+	// etag, so the acting tab has to reload to see it rather than being
+	// handed a fragment to swap in.
+	w.Header().Set("HX-Refresh", "true")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDeleteCollectionCover removes a collection's cover. Idempotent: the
+// store method already tolerates a call with no cover left to remove (see
+// DeleteCollectionImage), and this handler passes that straight through as
+// 204 rather than checking first — the remove control sits on a live page,
+// and a double-click or two tabs racing must not surface an error for a state
+// already reached.
+func (s *Server) handleDeleteCollectionCover(w http.ResponseWriter, r *http.Request) {
+	_, c, ok := s.collectionFor(w, r, false)
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteCollectionImage(r.Context(), c.ID); err != nil {
+		internalError(w, "handleDeleteCollectionCover", err)
+		return
+	}
+	origin := liveOrigin(r)
+	s.live.Publish(live.CollectionTopic(c.ID), live.Event{Kind: "collection", Action: "cover", Origin: origin})
+	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusNoContent)
 }
 

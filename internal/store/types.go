@@ -63,3 +63,18 @@ type CollectionView struct {
 	ItemCount  int
 	DoneCount  int
 }
+
+// CollectionImage is a collection's cover: at most one per collection. Mime
+// is always "image/jpeg" today — the server re-encodes every upload — but
+// the column is read back rather than hardcoded so the serving path keeps
+// working if that ever changes. ETag is a content hash computed on write and
+// is what makes the cover's URL safe to cache as immutable. Width and Height
+// let the <img> carry intrinsic dimensions, so the banner does not pop in
+// and shove the page down while it loads.
+type CollectionImage struct {
+	Mime   string
+	Bytes  []byte
+	ETag   string
+	Width  int
+	Height int
+}

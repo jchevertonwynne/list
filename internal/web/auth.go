@@ -19,9 +19,13 @@ const accessEmailHeader = "Cf-Access-Authenticated-User-Email"
 // this is the only place that assumption gets made true.
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Every authenticated page is specific to the user who requested it,
-		// so it must never be served from a shared cache — Cloudflare's edge
-		// cache in particular, which sits in front of this exact header.
+		// no-store is the default: every authenticated page is specific to
+		// the user who requested it, so it must never be served from a
+		// shared cache — Cloudflare's edge cache in particular, which sits in
+		// front of this exact header. A handler may override this on its own
+		// response; cacheImmutable (routes.go) is the one place that does,
+		// for a collection cover, and it is safe precisely because that
+		// response is not this one.
 		w.Header().Set("Cache-Control", "no-store")
 
 		email := normalizeEmail(r.Header.Get(accessEmailHeader))

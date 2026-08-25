@@ -252,7 +252,15 @@ func TestBackfillSeedsPositionFromID(t *testing.T) {
 
 	// Open against only the migrations that predate the position column, so
 	// the items table on disk has no position column yet.
-	prePosition := len(migrations) - 2 // the ALTER TABLE and the backfill UPDATE
+	//
+	// Deliberately a literal, not len(migrations)-2: migrations is
+	// append-only, so that expression would silently slide forward to mean
+	// something else every time a migration is added after this one — as it
+	// did the first time, when it started including the ALTER TABLE this
+	// test exists to exercise, and still passed, because the column has
+	// DEFAULT 0. A literal fails loudly (wrong item count, or the ALTER
+	// erroring on a column that already exists) if it ever drifts instead.
+	const prePosition = 6
 	original := migrations
 	migrations = migrations[:prePosition]
 	db, err := Open(path)
@@ -541,5 +549,188 @@ func TestErrNotFound(t *testing.T) {
 	}
 	if err := db.DeleteItem(ctx, 999); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("DeleteItem(missing) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestSetCollectionImageRoundTrips is the basic set/get path: what
+// SetCollectionImage writes is what CollectionImage and CollectionImageETag
+// read back.
+func TestSetCollectionImageRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	want := []byte("not actually a jpeg")
+	if err := db.SetCollectionImage(ctx, c.ID, "image/jpeg", want, "etag1", 100, 200); err != nil {
+		t.Fatalf("SetCollectionImage: %v", err)
+	}
+
+	img, err := db.CollectionImage(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("CollectionImage: %v", err)
+	}
+	if img.Mime != "image/jpeg" || string(img.Bytes) != string(want) || img.ETag != "etag1" || img.Width != 100 || img.Height != 200 {
+		t.Fatalf("CollectionImage = %+v, want mime=image/jpeg bytes=%q etag=etag1 width=100 height=200", img, want)
+	}
+
+	etag, width, height, err := db.CollectionImageETag(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("CollectionImageETag: %v", err)
+	}
+	if etag != "etag1" || width != 100 || height != 200 {
+		t.Fatalf("CollectionImageETag = (%q, %d, %d), want (etag1, 100, 200)", etag, width, height)
+	}
+}
+
+// TestSetCollectionImageReplaceOverwrites is the property that makes
+// SetCollectionImage an upsert rather than an append: setting a second cover
+// on the same collection must leave exactly one row, holding the new bytes,
+// not two rows or a duplicate-key error.
+func TestSetCollectionImageReplaceOverwrites(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	if err := db.SetCollectionImage(ctx, c.ID, "image/jpeg", []byte("first"), "etag1", 100, 200); err != nil {
+		t.Fatalf("SetCollectionImage (first): %v", err)
+	}
+	if err := db.SetCollectionImage(ctx, c.ID, "image/jpeg", []byte("second"), "etag2", 300, 400); err != nil {
+		t.Fatalf("SetCollectionImage (second): %v", err)
+	}
+
+	var rowCount int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM collection_images WHERE collection_id = ?`, c.ID).Scan(&rowCount); err != nil {
+		t.Fatalf("count collection_images rows: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("collection_images has %d rows for collection %d, want exactly 1", rowCount, c.ID)
+	}
+
+	img, err := db.CollectionImage(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("CollectionImage: %v", err)
+	}
+	if string(img.Bytes) != "second" || img.ETag != "etag2" || img.Width != 300 || img.Height != 400 {
+		t.Fatalf("CollectionImage after replace = %+v, want second/etag2/300/400", img)
+	}
+}
+
+// TestCollectionImageCascadesOnCollectionDelete proves the cover rides the
+// same ON DELETE CASCADE that TestForeignKeysCascadeOnDelete already proves
+// for items and memberships, rather than needing its own cleanup code.
+func TestCollectionImageCascadesOnCollectionDelete(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	if err := db.SetCollectionImage(ctx, c.ID, "image/jpeg", []byte("cover"), "etag1", 100, 200); err != nil {
+		t.Fatalf("SetCollectionImage: %v", err)
+	}
+
+	if err := db.DeleteCollection(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteCollection: %v", err)
+	}
+
+	var rowCount int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM collection_images WHERE collection_id = ?`, c.ID).Scan(&rowCount); err != nil {
+		t.Fatalf("count collection_images rows: %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("collection_images row survived collection delete; foreign_keys pragma is not taking effect")
+	}
+}
+
+// TestCollectionImageAbsentIsErrNotFound matches the house pattern: a cover
+// looked up by collection id with no prior existence check reports its
+// absence as ErrNotFound, the same as Collection and Item.
+func TestCollectionImageAbsentIsErrNotFound(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	if _, err := db.CollectionImage(ctx, 999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CollectionImage(missing) = %v, want ErrNotFound", err)
+	}
+}
+
+// TestCollectionImageETagAbsentIsNotAnError is the opposite of
+// TestCollectionImageAbsentIsErrNotFound, and is the whole reason
+// CollectionImageETag exists as its own method rather than a thin wrapper
+// around CollectionImage: most collections have no cover, and a caller that
+// checks on every render must not be forced to handle an error for the
+// common case.
+func TestCollectionImageETagAbsentIsNotAnError(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	etag, width, height, err := db.CollectionImageETag(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("CollectionImageETag(no cover) returned an error: %v", err)
+	}
+	if etag != "" || width != 0 || height != 0 {
+		t.Fatalf("CollectionImageETag(no cover) = (%q, %d, %d), want (\"\", 0, 0)", etag, width, height)
+	}
+}
+
+// TestDeleteCollectionImageIsIdempotent is the property that lets the remove
+// button on a live collection page not surface an error on a double-click:
+// deleting a cover that is already gone is a nil error both times, not
+// ErrNotFound the second time.
+func TestDeleteCollectionImageIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	db := open(t)
+
+	owner, err := db.UserByEmail(ctx, "owner@example.com")
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c, err := db.CreateCollection(ctx, owner.ID, "Groceries")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	if err := db.SetCollectionImage(ctx, c.ID, "image/jpeg", []byte("cover"), "etag1", 100, 200); err != nil {
+		t.Fatalf("SetCollectionImage: %v", err)
+	}
+
+	if err := db.DeleteCollectionImage(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteCollectionImage (first, cover exists): %v", err)
+	}
+	if err := db.DeleteCollectionImage(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteCollectionImage (second, already gone): %v", err)
+	}
+
+	if _, err := db.CollectionImage(ctx, c.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CollectionImage after delete = %v, want ErrNotFound", err)
 	}
 }

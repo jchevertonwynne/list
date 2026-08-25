@@ -1,7 +1,15 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"hash/crc32"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -59,6 +67,95 @@ func do(t *testing.T, h http.Handler, method, path, email string, form url.Value
 	return rec
 }
 
+// doMultipart is do()'s counterpart for the cover upload, the one route that
+// takes a real file rather than a urlencoded form. It wraps data in a single
+// part named "cover" — the form name handleUploadCollectionCover requires —
+// under the multipart/form-data encoding htmx actually sends for it (see the
+// plan's note on hx-encoding).
+func doMultipart(t *testing.T, h http.Handler, method, path, email string, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatalf("write cover part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	r := httptest.NewRequest(method, path, &body)
+	r.Header.Set("Cf-Access-Authenticated-User-Email", email)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	r.Header.Set("HX-Request", "true")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	return rec
+}
+
+// smallJPEG builds a small, valid JPEG from a solid generated image — good
+// enough to exercise the decode/re-encode pipeline without a real photo.
+// seed varies the pixel colours so two calls produce different bytes, and
+// therefore different etags, which the cross-collection test below needs.
+func smallJPEG(t *testing.T, seed uint8) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := range 8 {
+		for x := range 8 {
+			img.Set(x, y, color.RGBA{seed, uint8(x * 16), uint8(y * 16), 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("jpeg.Encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// jpegWithEXIF builds a valid JPEG and splices an APP1 segment carrying a
+// fake EXIF blob right after the SOI marker — the shape a real phone photo
+// takes, minus the actual camera. It exists to prove the server's re-encode
+// strips it, rather than trusting the browser's own canvas step to have done
+// so — see "Stripping metadata" in the plan.
+func jpegWithEXIF(t *testing.T) []byte {
+	t.Helper()
+	base := smallJPEG(t, 42)
+
+	payload := append([]byte("Exif\x00\x00"), bytes.Repeat([]byte{0xAB}, 32)...)
+	length := len(payload) + 2 // the JPEG segment length includes itself
+	segment := []byte{0xFF, 0xE1, byte(length >> 8), byte(length)}
+	segment = append(segment, payload...)
+
+	out := make([]byte, 0, len(base)+len(segment))
+	out = append(out, base[:2]...) // SOI
+	out = append(out, segment...)  // spliced-in APP1/EXIF
+	out = append(out, base[2:]...)
+	return out
+}
+
+// pngClaimingHugeDimensions builds a real, tiny PNG and then rewrites its
+// IHDR chunk's width/height (recomputing the chunk CRC to match) so the
+// header claims dimensions with nothing to do with the handful of bytes that
+// actually follow — exactly the shape of a decompression-bomb file. A
+// non-paletted PNG's DecodeConfig returns as soon as IHDR is parsed, so
+// nothing after byte 33 (8-byte signature + 25-byte IHDR chunk) is ever read
+// to produce that config, however implausible the rest of the file is.
+func pngClaimingHugeDimensions(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatalf("png.Encode: %v", err)
+	}
+	out := append([]byte(nil), buf.Bytes()[:33]...)
+	binary.BigEndian.PutUint32(out[16:20], 30000) // width
+	binary.BigEndian.PutUint32(out[20:24], 30000) // height
+	crc := crc32.ChecksumIEEE(out[12:29])         // "IHDR" + its 13 data bytes
+	binary.BigEndian.PutUint32(out[29:33], crc)
+	return out
+}
+
 // fixture builds a collection owned by owner, shared with member, holding one
 // item.
 func fixture(t *testing.T, db *store.DB) (store.Collection, store.ItemView) {
@@ -108,6 +205,9 @@ func TestStrangerSeesNothing(t *testing.T) {
 		{http.MethodPut, itemPath, url.Values{"title": {"nope"}}},
 		{http.MethodPost, itemPath + "/toggle", nil},
 		{http.MethodDelete, itemPath, nil},
+		{http.MethodGet, path(c, "/cover/deadbeef"), nil},
+		{http.MethodPut, path(c, "/cover"), nil},
+		{http.MethodDelete, path(c, "/cover"), nil},
 	}
 	for _, tc := range cases {
 		rec := do(t, h, tc.method, tc.url, stranger, tc.form)
@@ -158,6 +258,14 @@ func TestMemberCanEditItems(t *testing.T) {
 	}
 	if rec := do(t, h, http.MethodPost, itemPath+"/toggle", member, nil); rec.Code != http.StatusOK {
 		t.Errorf("member toggling = %d, want 200", rec.Code)
+	}
+	// The cover follows the same any-member bar as everything else here — see
+	// collectionFor(w, r, false) on all three cover routes.
+	if rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, smallJPEG(t, 1)); rec.Code != http.StatusNoContent {
+		t.Errorf("member uploading cover = %d, want 204", rec.Code)
+	}
+	if rec := do(t, h, http.MethodDelete, path(c, "/cover"), member, nil); rec.Code != http.StatusNoContent {
+		t.Errorf("member deleting cover = %d, want 204", rec.Code)
 	}
 }
 
@@ -380,5 +488,208 @@ func TestItemTitleIsEscaped(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "&lt;script&gt;") {
 		t.Errorf("expected the escaped form in the output: %s", rec.Body.String())
+	}
+}
+
+// ------------------------------------------------------------------- covers
+
+// An upload past maxCoverBytes is refused before any image work happens on
+// it. The data itself is not a valid image at all — size is what this test
+// means to exercise, and the size check runs before the content sniff.
+func TestCoverUploadRejectsOversize(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	data := bytes.Repeat([]byte("a"), maxCoverBytes+1024)
+	rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, data)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize cover upload = %d, want 413", rec.Code)
+	}
+}
+
+// Something that is not an image at all is refused by the sniff check, well
+// before any decode is attempted.
+func TestCoverUploadRejectsNonImage(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, []byte("just some text, not a picture"))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("non-image cover upload = %d, want 422", rec.Code)
+	}
+}
+
+// A small file that merely declares an enormous width and height is rejected
+// by the DecodeConfig dimension guard, before image.Decode ever runs and
+// tries to allocate for it — see maxCoverEdge/maxCoverPixels in routes.go.
+func TestCoverUploadRejectsHugeDimensions(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, pngClaimingHugeDimensions(t))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("cover claiming huge dimensions = %d, want 422", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "too large") {
+		t.Errorf("rejection does not mention the dimensions: %s", rec.Body.String())
+	}
+}
+
+// The test that matters most in this step: a JPEG carrying a spliced-in
+// APP1/EXIF segment comes back from the serving route with no APPn segment
+// of any kind, proving the server's decode/re-encode is what strips it — not
+// the browser's canvas step, which this request bypasses entirely.
+func TestCoverUploadStripsEXIF(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	upload := jpegWithEXIF(t)
+	if !bytes.Contains(upload, []byte{0xFF, 0xE1}) {
+		t.Fatal("test fixture does not actually contain an APP1 marker")
+	}
+
+	rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, upload)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading a cover with EXIF = %d, want 204", rec.Code)
+	}
+
+	etag, _, _, err := db.CollectionImageETag(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("CollectionImageETag: %v", err)
+	}
+	if etag == "" {
+		t.Fatal("no cover etag stored after upload")
+	}
+
+	rec = do(t, h, http.MethodGet, path(c, "/cover/"+etag), member, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fetching the stored cover = %d, want 200", rec.Code)
+	}
+
+	stored := rec.Body.Bytes()
+	if bytes.Contains(stored, []byte{0xFF, 0xE1}) {
+		t.Error("stored cover still contains an APP1 marker")
+	}
+	for i := 0; i < len(stored)-1; i++ {
+		if stored[i] == 0xFF && stored[i+1] >= 0xE0 && stored[i+1] <= 0xEF {
+			t.Fatalf("stored cover contains an APPn marker (0xFF 0x%02X) at byte %d", stored[i+1], i)
+		}
+	}
+}
+
+// A served cover carries the type actually stored (never anything a client
+// could have claimed), nosniff, and the cacheImmutable override rather than
+// the no-store default.
+func TestCoverServingHeaders(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	if rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, smallJPEG(t, 7)); rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading cover = %d, want 204", rec.Code)
+	}
+	etag, _, _, err := db.CollectionImageETag(context.Background(), c.ID)
+	if err != nil || etag == "" {
+		t.Fatalf("CollectionImageETag: etag=%q err=%v", etag, err)
+	}
+
+	rec := do(t, h, http.MethodGet, path(c, "/cover/"+etag), member, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fetching cover = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/jpeg" {
+		t.Errorf("Content-Type = %q, want image/jpeg", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	cc := rec.Header().Get("Cache-Control")
+	if !strings.Contains(cc, "private") || !strings.Contains(cc, "immutable") {
+		t.Errorf("Cache-Control = %q, want it to contain private and immutable", cc)
+	}
+	if strings.Contains(cc, "no-store") {
+		t.Errorf("Cache-Control = %q, must not carry no-store", cc)
+	}
+}
+
+// authenticate's no-store default must still reach an ordinary route
+// unchanged — pinning this is what keeps the cacheImmutable override an
+// exception rather than something that quietly spreads.
+func TestOrdinaryRouteStillCarriesNoStore(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := do(t, h, http.MethodGet, path(c, ""), member, nil)
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control on an ordinary route = %q, want no-store", got)
+	}
+}
+
+// A path {etag} that does not match what is actually stored 404s rather than
+// silently serving whatever the current cover happens to be — the property
+// that makes the immutable caching directive on a match truthful.
+func TestCoverWrongEtagNotFound(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	if rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), member, smallJPEG(t, 9)); rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading cover = %d, want 204", rec.Code)
+	}
+	etag, _, _, err := db.CollectionImageETag(context.Background(), c.ID)
+	if err != nil || etag == "" {
+		t.Fatalf("CollectionImageETag: etag=%q err=%v", etag, err)
+	}
+	wrong := etag[:len(etag)-1] + "0"
+	if wrong == etag {
+		wrong = etag[:len(etag)-1] + "1"
+	}
+
+	rec := do(t, h, http.MethodGet, path(c, "/cover/"+wrong), member, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("wrong etag = %d, want 404", rec.Code)
+	}
+}
+
+// A collection's cover is not reachable by naming a different collection's
+// URL, even by a caller who is a legitimate member of that other collection —
+// the {collection} and {etag} segments are checked together, not separately.
+func TestCoverNotReachableThroughAnotherCollection(t *testing.T) {
+	h, db := newTestServer(t)
+	ctx := context.Background()
+	c1, _ := fixture(t, db)
+
+	o, err := db.UserByEmail(ctx, owner)
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	c2, err := db.CreateCollection(ctx, o.ID, "other")
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	if _, err := db.AddMember(ctx, c2.ID, member); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+
+	if rec := doMultipart(t, h, http.MethodPut, path(c1, "/cover"), owner, smallJPEG(t, 11)); rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading cover to c1 = %d, want 204", rec.Code)
+	}
+	if rec := doMultipart(t, h, http.MethodPut, path(c2, "/cover"), owner, smallJPEG(t, 200)); rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading cover to c2 = %d, want 204", rec.Code)
+	}
+
+	etag1, _, _, err := db.CollectionImageETag(ctx, c1.ID)
+	if err != nil || etag1 == "" {
+		t.Fatalf("CollectionImageETag(c1): etag=%q err=%v", etag1, err)
+	}
+	etag2, _, _, err := db.CollectionImageETag(ctx, c2.ID)
+	if err != nil || etag2 == "" {
+		t.Fatalf("CollectionImageETag(c2): etag=%q err=%v", etag2, err)
+	}
+	if etag1 == etag2 {
+		t.Fatal("test fixture produced identical etags for two different covers")
+	}
+
+	rec := do(t, h, http.MethodGet, path(c2, "/cover/"+etag1), member, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("c1's cover through c2's URL = %d, want 404", rec.Code)
 	}
 }

@@ -34,6 +34,7 @@
   <script src="/static/sortable.min.js"></script>
   <script src="/static/live.js" defer></script>
   <script src="/static/reorder.js" defer></script>
+  <script src="/static/cover.js" defer></script>
 
   <style>
     /* Only what Beer CSS doesn't already give us for this app's lists.
@@ -226,6 +227,21 @@
        they need to sit closer to what they label than to what precedes it. */
     .section-heading {
       margin-block: 2rem 0.5rem;
+    }
+
+    /* The banner's width/height attributes reserve the right amount of
+       vertical space before the image loads, which stops the page jumping —
+       but only if every cover renders at the same shape regardless of what
+       was uploaded. Without a fixed aspect ratio a portrait phone photo
+       would still make the banner as tall as it is wide, shoving everything
+       below it down the page. object-fit:cover crops to fill that shape
+       rather than squashing the image to fit it. */
+    .cover-banner {
+      display: block;
+      inline-size: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      margin-block-end: 1rem;
     }
   </style>
 </head>

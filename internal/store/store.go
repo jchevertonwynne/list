@@ -74,6 +74,25 @@ var migrations = []string{
 	// in creation order). Seeding position from id makes that existing order
 	// explicit and stable instead of an accident of the tiebreak.
 	`UPDATE items SET position = id`,
+	// A separate table rather than a column on collections: CollectionsForUser
+	// and Items both SELECT every column of their rows, and a blob on
+	// collections would push those rows onto overflow pages and drag image
+	// bytes through the page cache on every list render. collection_id as the
+	// sole primary key expresses "one cover per collection" in the schema
+	// itself rather than in handler discipline, and turns a replace into a
+	// plain INSERT ... ON CONFLICT DO UPDATE rather than a delete-then-insert.
+	// ON DELETE CASCADE relies on the foreign_keys(1) pragma in Open, already
+	// proved by TestForeignKeysCascadeOnDelete. No timestamp column: the etag
+	// is already the version marker, and nothing renders a "cover updated"
+	// time, so a column written but never read would be dead weight.
+	`CREATE TABLE collection_images (
+		collection_id INTEGER PRIMARY KEY REFERENCES collections(id) ON DELETE CASCADE,
+		mime          TEXT NOT NULL,
+		bytes         BLOB NOT NULL,
+		etag          TEXT NOT NULL,
+		width         INTEGER NOT NULL,
+		height        INTEGER NOT NULL
+	)`,
 }
 
 // Open opens (creating if necessary) the SQLite file at path and brings its
@@ -587,5 +606,97 @@ func (d *DB) RemoveMember(ctx context.Context, collectionID, userID int64) error
 			return fmt.Errorf("remove member %d from collection %d: %w", userID, collectionID, err)
 		}
 		return notFoundIfNoRows(res, "member %d of collection %d", userID, collectionID)
+	})
+}
+
+// SetCollectionImage upserts a collection's cover, replacing whatever was
+// there before. collection_id being the sole primary key on
+// collection_images (see the migrations comment) is what turns "replace"
+// into a plain ON CONFLICT DO UPDATE rather than a delete followed by an
+// insert.
+func (d *DB) SetCollectionImage(ctx context.Context, collectionID int64, mime string, data []byte, etag string, width, height int) error {
+	return withSpanErr(ctx, "SetCollectionImage", func(ctx context.Context) error {
+		if _, err := d.db.ExecContext(ctx, `
+			INSERT INTO collection_images (collection_id, mime, bytes, etag, width, height)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (collection_id) DO UPDATE SET
+				mime = excluded.mime,
+				bytes = excluded.bytes,
+				etag = excluded.etag,
+				width = excluded.width,
+				height = excluded.height
+		`, collectionID, mime, data, etag, width, height); err != nil {
+			return fmt.Errorf("set cover for collection %d: %w", collectionID, err)
+		}
+		return nil
+	})
+}
+
+// CollectionImage loads a collection's cover, bytes included. Absence is
+// ErrNotFound, matching the house pattern for a row looked up by id with no
+// prior existence check (see Collection, Item). Callers that only need the
+// etag and dimensions — the collection page, on every render — should use
+// CollectionImageETag instead: this is the one method that touches the blob
+// column and is meant for the serving path alone.
+func (d *DB) CollectionImage(ctx context.Context, collectionID int64) (CollectionImage, error) {
+	return withSpan(ctx, "CollectionImage", func(ctx context.Context) (CollectionImage, error) {
+		var img CollectionImage
+		err := d.db.QueryRowContext(ctx, `
+			SELECT mime, bytes, etag, width, height FROM collection_images WHERE collection_id = ?
+		`, collectionID).Scan(&img.Mime, &img.Bytes, &img.ETag, &img.Width, &img.Height)
+		if errors.Is(err, sql.ErrNoRows) {
+			return CollectionImage{}, fmt.Errorf("cover for collection %d: %w", collectionID, ErrNotFound)
+		}
+		if err != nil {
+			return CollectionImage{}, fmt.Errorf("load cover for collection %d: %w", collectionID, err)
+		}
+		return img, nil
+	})
+}
+
+// CollectionImageETag returns a collection's cover etag and dimensions
+// without selecting bytes. Avoiding the blob column is the entire point: the
+// collection page calls this on every render simply to decide whether to
+// draw a banner, and going through CollectionImage instead would drag the
+// image bytes through the page cache on every single page load to answer a
+// question the etag alone already answers.
+//
+// A missing cover is not an error here, unlike CollectionImage: most
+// collections never get one, so "no cover" is the ordinary outcome of this
+// call, not an exceptional one. An empty etag with a nil error is how that
+// is reported.
+func (d *DB) CollectionImageETag(ctx context.Context, collectionID int64) (etag string, width, height int, err error) {
+	type dims struct {
+		etag          string
+		width, height int
+	}
+	m, err := withSpan(ctx, "CollectionImageETag", func(ctx context.Context) (dims, error) {
+		var m dims
+		scanErr := d.db.QueryRowContext(ctx, `
+			SELECT etag, width, height FROM collection_images WHERE collection_id = ?
+		`, collectionID).Scan(&m.etag, &m.width, &m.height)
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return dims{}, nil
+		}
+		if scanErr != nil {
+			return dims{}, fmt.Errorf("load cover etag for collection %d: %w", collectionID, scanErr)
+		}
+		return m, nil
+	})
+	return m.etag, m.width, m.height, err
+}
+
+// DeleteCollectionImage removes a collection's cover, if it has one.
+// Deleting when there is no cover is a nil error, not ErrNotFound — this
+// deliberately departs from the notFoundIfNoRows pattern used elsewhere in
+// this file. The remove control sits on a live collection page, and a
+// double-click (or two tabs racing) must not surface an error for a state
+// the user already reached.
+func (d *DB) DeleteCollectionImage(ctx context.Context, collectionID int64) error {
+	return withSpanErr(ctx, "DeleteCollectionImage", func(ctx context.Context) error {
+		if _, err := d.db.ExecContext(ctx, `DELETE FROM collection_images WHERE collection_id = ?`, collectionID); err != nil {
+			return fmt.Errorf("delete cover for collection %d: %w", collectionID, err)
+		}
+		return nil
 	})
 }

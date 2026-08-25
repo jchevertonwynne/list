@@ -17,11 +17,13 @@ package web
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -176,6 +178,34 @@ func doOrigin(t *testing.T, h http.Handler, method, path, email, origin string, 
 	return rec
 }
 
+// doMultipartOrigin is doMultipart (routes_test.go) plus an X-Live-Origin
+// header, for the cover-upload counterpart to doOrigin above. doMultipart
+// itself is not touched, for the same reason do() isn't: other tests depend
+// on its exact signature.
+func doMultipartOrigin(t *testing.T, h http.Handler, method, path, email, origin string, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatalf("write cover part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	r := httptest.NewRequest(method, path, &body)
+	r.Header.Set("Cf-Access-Authenticated-User-Email", email)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	r.Header.Set("HX-Request", "true")
+	r.Header.Set("X-Live-Origin", origin)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	return rec
+}
+
 // A stranger must never see any part of a stream response, not even one that
 // then errors, because that would mean stream() had already started writing
 // headers before authorisation ran. Asserting both the status and that
@@ -297,6 +327,78 @@ func TestOriginIsStampedOnEvent(t *testing.T) {
 	}
 
 	ev := mustReadEventOfKind(t, r, "items")
+	if ev.Origin != tab {
+		t.Errorf("event origin = %q, want %q", ev.Origin, tab)
+	}
+}
+
+// Setting a cover has no fragment of its own to swap — live.js's "cover" case
+// just reloads the page (see the comment beside it) — but it still has to
+// reach a second browser at all before that reload can happen.
+func TestCoverUploadReachesCollectionStream(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	r, closeStream := openStream(t, srv, path(c, "/live"), member)
+	defer closeStream()
+
+	rec := doMultipart(t, h, http.MethodPut, path(c, "/cover"), owner, smallJPEG(t, 1))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading cover = %d, want 204", rec.Code)
+	}
+
+	ev := mustReadEventOfKind(t, r, "collection")
+	if ev.Action != "cover" {
+		t.Errorf("event = %+v, want action=cover", ev)
+	}
+}
+
+// Removing a cover publishes the same event shape as setting one: the client
+// side doesn't distinguish "there's a new banner" from "the banner is gone",
+// it just reloads either way.
+func TestCoverDeleteReachesCollectionStream(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	r, closeStream := openStream(t, srv, path(c, "/live"), member)
+	defer closeStream()
+
+	rec := do(t, h, http.MethodDelete, path(c, "/cover"), owner, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("deleting cover = %d, want 204", rec.Code)
+	}
+
+	ev := mustReadEventOfKind(t, r, "collection")
+	if ev.Action != "cover" {
+		t.Errorf("event = %+v, want action=cover", ev)
+	}
+}
+
+// Same contract as TestOriginIsStampedOnEvent, for the cover upload: live.js
+// filters an event by comparing ev.origin against its own tab id, which only
+// works if the server stamps the mutating request's X-Live-Origin header back
+// onto the event it publishes. This is the server half of that contract for
+// handleUploadCollectionCover.
+func TestCoverOriginIsStampedOnEvent(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	r, closeStream := openStream(t, srv, path(c, "/live"), member)
+	defer closeStream()
+
+	const tab = "test-cover-tab"
+	rec := doMultipartOrigin(t, h, http.MethodPut, path(c, "/cover"), owner, tab, smallJPEG(t, 2))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("uploading cover = %d, want 204", rec.Code)
+	}
+
+	ev := mustReadEventOfKind(t, r, "collection")
 	if ev.Origin != tab {
 		t.Errorf("event origin = %q, want %q", ev.Origin, tab)
 	}

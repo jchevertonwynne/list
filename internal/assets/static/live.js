@@ -90,6 +90,13 @@
           case "deleted":
             location.replace("/");
             break;
+          case "cover":
+            // The banner sits outside #items/#members, so there is no
+            // fragment to swap, and the <img> src is content-addressed —
+            // reloading is what picks up the new etag, same reasoning as
+            // "renamed" above.
+            location.reload();
+            break;
         }
         break;
 

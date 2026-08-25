@@ -83,8 +83,9 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, userID int64, to
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Connection", "keep-alive")
-	// Cache-Control: no-store is already set by authenticate on every
-	// response, streams included.
+	// Cache-Control: no-store is already set by authenticate as the default
+	// for every response, streams included; nothing about a stream calls for
+	// this one to take the cacheImmutable override instead.
 	w.Header().Set("X-Accel-Buffering", "no") // belt and braces against a buffering proxy
 
 	// Subscribe happens before any byte is written, so this preamble is proof
