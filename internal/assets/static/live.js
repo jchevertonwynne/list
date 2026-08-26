@@ -151,20 +151,55 @@
     }
   }
 
-  const source = new EventSource(url);
-
   // onopen fires on the very first connect as well as every reconnect, but a
   // freshly loaded page is already up to date, so only a reconnect needs the
-  // re-sync.
+  // re-sync. The flag lives out here rather than inside connect() so that the
+  // first open of a *replacement* EventSource still counts as a reconnect:
+  // the page has been disconnected either way, and owes itself a re-sync.
   let reconnected = false;
-  source.onopen = () => {
-    if (reconnected) resync();
-    reconnected = true;
-  };
 
-  source.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    if (ev.origin === TAB) return;
-    handle(ev);
-  };
+  // Backoff for reopening after EventSource has given up on its own. It
+  // starts at the same 3s the server suggests in its "retry:" preamble and
+  // doubles from there, because the reasons it gives up are not the kind that
+  // clear in three seconds — the per-user connection cap still holding stale
+  // slots, or an expired Access session waiting on a human to log back in.
+  const RETRY_MIN = 3000;
+  const RETRY_MAX = 60000;
+  let retry = RETRY_MIN;
+  let timer = null;
+  let source = null;
+
+  function connect() {
+    timer = null;
+    source = new EventSource(url);
+
+    source.onopen = () => {
+      retry = RETRY_MIN;
+      if (reconnected) resync();
+      reconnected = true;
+    };
+
+    source.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+      if (ev.origin === TAB) return;
+      handle(ev);
+    };
+
+    // An error with readyState CONNECTING is the browser retrying by itself,
+    // which is the ordinary case and needs nothing from us. CLOSED is the one
+    // worth handling: it means the browser has given up permanently, because
+    // what came back was not a stream at all. That is what the 429 from the
+    // per-user connection cap looks like, and what the login redirect Access
+    // serves once a session lapses looks like too. Left alone, the page would
+    // go on looking live indefinitely while receiving nothing, so reopen by
+    // hand — and let the resync above repair whatever was missed meanwhile.
+    source.onerror = () => {
+      if (source.readyState !== EventSource.CLOSED || timer !== null) return;
+      source.close();
+      timer = setTimeout(connect, retry);
+      retry = Math.min(retry * 2, RETRY_MAX);
+    };
+  }
+
+  connect();
 })();
