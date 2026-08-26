@@ -125,9 +125,10 @@
 
     /* Beer's <ul class="list"> rows have no vertical breathing room by
        default, which reads fine for a menu but cramped for a row that
-       carries a title and a body line. */
-    .list.collections > li,
-    .list.items > li {
+       carries a title and a body line. Collections get their breathing
+       room from this rule; items get theirs — and more — from the rule
+       below, which has to fight considerably harder for it. */
+    .list.collections > li {
       padding-block: 0.75rem;
     }
 
@@ -136,6 +137,36 @@
        spends more of a phone's width on space than on the buttons. */
     .list.items > li {
       gap: 0.5rem;
+    }
+
+    /* Beer's `.list>li:has(ul,ol,details[open],a:only-child){padding:0}`
+       is meant for nav rows that are wholly a single link — a settings
+       menu entry, say. `:only-child` counts only *element* siblings and
+       ignores text nodes, so once an item's title renders as
+       `<div class="item-title">check <a href=…>…</a></div>` — a run of
+       plain text followed by one link — that anchor genuinely is its
+       parent's only *element* child, and the whole row matches Beer's
+       selector and loses all its padding. That is worse than a cosmetic
+       miss, because the match is conditional on how many links happen to
+       land in the title: a row with two links has no `:only-child` anchor
+       and keeps its padding, so without this fix the list would show
+       unpadded and padded rows side by side depending on what a user
+       happened to paste.
+
+       This cannot be fixed by tightening the rule above, because Beer's
+       selector wins on specificity regardless: `:has()` takes the
+       specificity of its most specific argument, `a:only-child`, so
+       Beer's rule is (0,2,2) — beating this file's own
+       `.list.items > li` at (0,2,1) — and that lets it override both
+       Beer's own inline `padding:.5rem 1rem` and the padding-block rule
+       above. `.list.items > li.item` adds a second class and reaches
+       (0,3,1), which finally wins. The block value here is 0.75rem
+       rather than Beer's own 0.5rem baseline, so that a row which trips
+       this bug ends up exactly as padded as one that doesn't — the point
+       is to restore what this file already decided an item row should
+       look like, not to fall back to Beer's smaller default. */
+    .list.items > li.item {
+      padding: 0.75rem 1rem;
     }
 
     /* Beer sets white-space: nowrap on list rows, which suits a menu label
@@ -162,9 +193,18 @@
       opacity: 0.5;
     }
 
+    /* Mirrors .item-body below, and for the same reason: a title is free
+       text a user typed, not UI copy, so it can be arbitrarily long with
+       no natural break point. This bug already existed before links did —
+       a 200-character title with no spaces was already forcing horizontal
+       scroll — but it went unnoticed because nobody had a reason to paste
+       one. Linkifying titles gives people exactly that reason: pasting a
+       URL into a title is now a normal thing to do, so the pre-existing
+       gap has to close here rather than being patched on the anchor. */
     .item-title {
       font-weight: 500;
       line-height: 1.35;
+      overflow-wrap: break-word;
       white-space: normal;
     }
 
@@ -177,6 +217,34 @@
       white-space: pre-wrap;
       line-height: 1.4;
       margin-block-start: 0.125rem;
+    }
+
+    /* Beer's `a,button,.button{text-decoration:none;display:inline-flex;…}`
+       fights an inline link inside item text in two ways, and this undoes
+       both, scoped to the only two places a link can appear.
+
+       `display: inline` is load-bearing twice over, which makes it look
+       like the one removable line here:
+       - it restores ordinary mid-URL wrapping. `inline-flex` makes the
+         anchor an *atomic* inline box, laid out as a single unbreakable
+         unit no matter how long the text inside it is — exactly wrong for
+         a bare URL pasted into a note.
+       - it is also what lets `.item.done .item-title`'s `line-through`
+         reach the link text at all. A text decoration is painted by the
+         ancestor and propagates into non-atomic inline descendants only;
+         an atomic box opts out of that painting. Do not "fix" this by
+         adding a `.item.done .item-title a { text-decoration: line-through
+         underline }` rule — a descendant cannot remove a decoration
+         painted by its ancestor, so with plain `display: inline` the
+         strikethrough already reaches the link for free, and the
+         underline set here adds to it rather than replacing it. An
+         explicit rule here would be dead code carrying a false
+         explanation of why the strikethrough works. */
+    .item-title a,
+    .item-body a {
+      display: inline;
+      text-decoration: underline;
+      color: var(--primary);
     }
 
     /* Who added an item is provenance, not content: useful when two people

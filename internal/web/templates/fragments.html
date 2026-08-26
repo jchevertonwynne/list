@@ -5,6 +5,26 @@
     would drift the moment one was edited.
 */}}
 
+{{/* linkedText renders one linkify result (a []web.linkSegment) as running
+     text, linking whichever segments got a URL. It is its own define, not
+     the range copied inline at both call sites in "item" below, for the same
+     drift reason as this file's own opening comment.
+
+     This body MUST stay on one line. text/template emits the literal text
+     between actions byte for byte, and .item-body is white-space: pre-wrap
+     (layout.html), so a newline or leading indentation here would show up as
+     a real line break in the middle of text someone typed — routes_test.go
+     has a whitespace regression test that fails the build if this gets
+     reflowed.
+
+     Both call sites below invoke this from HTML text context, not an
+     attribute. That is load-bearing, not incidental: html/template computes
+     one escaping context per call site of a given template name, so calling
+     "linkedText" from an attribute somewhere else would make the two call
+     sites disagree and fail at parse time with "cannot compute output
+     context", rather than silently mis-escaping anything. */}}
+{{define "linkedText"}}{{range .}}{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Text}}</a>{{else}}{{.Text}}{{end}}{{end}}{{end}}
+
 {{/* item renders one row. Context is web.itemCtx: .Item and .Collection.
 
      Editing and deleting target the row itself, because neither moves it.
@@ -22,8 +42,8 @@
     <span></span>
   </label>
   <div class="max">
-    <div class="item-title">{{.Item.Title}}</div>
-    {{if .Item.Body}}<div class="item-body small-text">{{.Item.Body}}</div>{{end}}
+    <div class="item-title">{{template "linkedText" (linkify .Item.Title)}}</div>
+    {{if .Item.Body}}<div class="item-body small-text">{{template "linkedText" (linkify .Item.Body)}}</div>{{end}}
     <div class="item-meta small-text secondary-text">added by {{.Item.CreatorEmail}}</div>
   </div>
   <button class="circle transparent"

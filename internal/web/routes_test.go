@@ -183,6 +183,43 @@ func path(c store.Collection, suffix string) string {
 	return "/collections/" + strconv.FormatInt(c.ID, 10) + suffix
 }
 
+// extractDiv returns the inner content of the first <div class="class">…
+// </div> in s. Good enough for a test that only needs one fragment's markup,
+// without pulling an HTML parser in just to look inside a single element.
+func extractDiv(s, class string) (string, bool) {
+	open := `<div class="` + class + `">`
+	i := strings.Index(s, open)
+	if i < 0 {
+		return "", false
+	}
+	rest := s[i+len(open):]
+	j := strings.Index(rest, "</div>")
+	if j < 0 {
+		return "", false
+	}
+	return rest[:j], true
+}
+
+// stripTags removes every "<…>" run from s, leaving only its text nodes —
+// enough to recover linkedText's visible output from around the <a> tags it
+// may have introduced, which is all TestItemBodyWhitespaceIsPreserved below
+// needs.
+func stripTags(s string) string {
+	var b strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // A stranger must not be able to tell that a collection exists at all. Every
 // route answers 404, never 403: a 403 confirms the id is real and turns the
 // URL space into a directory of other people's lists.
@@ -488,6 +525,144 @@ func TestItemTitleIsEscaped(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "&lt;script&gt;") {
 		t.Errorf("expected the escaped form in the output: %s", rec.Body.String())
+	}
+}
+
+// A URL in a title becomes a real link, with the new-tab and no-referrer
+// attributes the plan settled on: you keep your place in the list, and the
+// destination is never told which app the click came from.
+func TestItemTitleIsLinkified(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := do(t, h, http.MethodPost, path(c, "/items"), owner, url.Values{"title": {"check https://example.com now"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adding item = %d, want 200", rec.Code)
+	}
+	want := `<a href="https://example.com" target="_blank" rel="noopener noreferrer">https://example.com</a>`
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("title anchor missing from output: %s", rec.Body.String())
+	}
+}
+
+// The body goes through the same "linkedText" define as the title, so it
+// gets the same link.
+func TestItemBodyIsLinkified(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := do(t, h, http.MethodPost, path(c, "/items"), owner, url.Values{"title": {"ok"}, "body": {"see https://example.com here"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adding item = %d, want 200", rec.Code)
+	}
+	want := `<a href="https://example.com" target="_blank" rel="noopener noreferrer">https://example.com</a>`
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("body anchor missing from output: %s", rec.Body.String())
+	}
+}
+
+// Linkifying a field must not weaken its escaping — a <script> payload
+// alongside a URL in the same field still comes out neutralised, and the URL
+// still becomes a link.
+func TestLinkifyDoesNotWeakenEscaping(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := do(t, h, http.MethodPost, path(c, "/items"), owner, url.Values{"title": {`<script>alert(1)</script> https://example.com`}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adding item = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<script>") {
+		t.Errorf("script tag was not escaped: %s", body)
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Errorf("expected the escaped form in the output: %s", body)
+	}
+	if !strings.Contains(body, `<a href="https://example.com" target="_blank" rel="noopener noreferrer">https://example.com</a>`) {
+		t.Errorf("URL in the same field as the script payload was not linkified: %s", body)
+	}
+}
+
+// A bare "www." address gets an "https://" href, but the displayed text
+// stays exactly as typed — see linkify's doc comment on why Text and URL can
+// differ for that one prefix.
+func TestBareWWWGetsHTTPSHref(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+
+	rec := do(t, h, http.MethodPost, path(c, "/items"), owner, url.Values{"title": {"www.example.com"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adding item = %d, want 200", rec.Code)
+	}
+	want := `<a href="https://www.example.com" target="_blank" rel="noopener noreferrer">www.example.com</a>`
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("www anchor missing or wrong in output: %s", rec.Body.String())
+	}
+}
+
+// itemForm (fragments.html) uses attribute and RCDATA contexts and was
+// deliberately never wired to "linkedText" — the edit form must keep
+// showing raw text, both so Save round-trips the actual value and so a URL
+// never turns into markup a person could not then edit as text.
+func TestEditFormIsNotLinkified(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+	ctx := context.Background()
+	o, err := db.UserByEmail(ctx, owner)
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	item, err := db.CreateItem(ctx, c.ID, o.ID, "check https://example.com", "")
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, path(c, "/items/"+strconv.FormatInt(item.ID, 10)+"/edit"), owner, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("editing item = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "https://example.com") {
+		t.Errorf("edit form does not contain the raw URL: %s", body)
+	}
+	if strings.Contains(body, "<a") {
+		t.Errorf("edit form was linkified: %s", body)
+	}
+}
+
+// The regression this whole feature is built to avoid: text/template emits
+// the "linkedText" define's body byte for byte, so a newline or leading
+// indentation introduced by someone tidying that line would show up as a
+// real line break in the middle of a pre-wrap note. This renders a body
+// with both a literal newline and a link, strips the tags linkedText can
+// introduce, and requires the result to be the input verbatim — not merely
+// "no obviously wrong whitespace", but exactly what was typed.
+func TestItemBodyWhitespaceIsPreserved(t *testing.T) {
+	h, db := newTestServer(t)
+	c, _ := fixture(t, db)
+	ctx := context.Background()
+	o, err := db.UserByEmail(ctx, owner)
+	if err != nil {
+		t.Fatalf("UserByEmail: %v", err)
+	}
+	const body = "a\nb https://x.com c"
+	item, err := db.CreateItem(ctx, c.ID, o.ID, "whitespace check", body)
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, path(c, "/items/"+strconv.FormatInt(item.ID, 10)), owner, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fetching item = %d, want 200", rec.Code)
+	}
+
+	inner, ok := extractDiv(rec.Body.String(), "item-body small-text")
+	if !ok {
+		t.Fatalf("no item-body div in output: %s", rec.Body.String())
+	}
+	if got := stripTags(inner); got != body {
+		t.Errorf("item-body text = %q, want %q (rendered div: %q)", got, body, inner)
 	}
 }
 

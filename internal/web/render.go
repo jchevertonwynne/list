@@ -61,10 +61,22 @@ var fragments *template.Template
 // belongs to in order to build its own action URLs. The alternative — storing
 // the collection id on every ItemView — would put a rendering concern into
 // the store.
+//
+// linkify is here for the same kind of reason: every render path — a full
+// page, an htmx swap, a live re-fetch after an SSE nudge — ends up calling
+// "item" in fragments.html, so a template function reaches all of them for
+// free. Splitting a title or body into segments in the handler instead would
+// mean every one of those callers had to build the segments itself before it
+// could reach the template at all, for a value the template needs and
+// nothing else does. No second registration was needed to get it there: this
+// map is already passed to .Funcs on both the per-page sets and the
+// standalone fragments set below, so one entry here covers every one of
+// those render paths.
 var funcs = template.FuncMap{
 	"itemCtx": func(item store.ItemView, c store.Collection) itemCtx {
 		return itemCtx{Item: item, Collection: c}
 	},
+	"linkify": linkify,
 }
 
 func init() {

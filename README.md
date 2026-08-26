@@ -117,6 +117,39 @@ presence is the proof, and nothing has to be stored to check it — which suits
 an app that keeps no session state of its own. A mismatched `Origin` is
 refused as well.
 
+## Links in item text
+
+An item's title and note are free text, so a URL pasted into either one
+renders as a clickable link rather than dead text you have to select and
+copy. Three schemes count: `http://`, `https://`, and a bare `www.`, which
+is linked as `https://` since nobody types the scheme when they say
+"www.example.com". Bare domains (`example.com` with no `www.`) and email
+addresses deliberately do not become links. A bare domain can't be
+detected without false positives — too much ordinary prose looks like
+`word.word`. An email address could be made a `mailto:` link, but on a
+phone that opens a mail client, which is a surprise when the address was
+only ever a note to self, not an invitation to write to someone.
+
+Links open in a new tab with `rel="noopener noreferrer"`. `noreferrer` is
+doing real work rather than duplicating a header: there is no
+`Referrer-Policy` anywhere in the app, so without it every click hands the
+destination site this app's origin. Current browsers default to
+`strict-origin-when-cross-origin`, so what leaks is the hostname rather than
+which list you were looking at — but on a private app behind Access the
+hostname is the interesting half, and `noreferrer` suppresses it outright.
+
+The linkifier itself never touches HTML. It splits an item's text into
+segments and hands the template plain strings — a run of text, or a URL —
+and the template does every bit of escaping: `{{.Text}}` renders in HTML
+text context, and `{{.URL}}` renders inside an `href`, which is URL
+context and gets `html/template`'s URL filter as an independent second
+gate on the scheme, on top of whatever the linkifier already decided was
+safe. Nothing in this feature hand-assembles a string of HTML out of text
+a user typed, which is the same property [CSRF](#csrf) above and
+[No external requests](#no-external-requests) below are both examples of:
+this app is fairly conservative about what it lets itself do with input it
+doesn't control.
+
 ## No external requests
 
 Beer CSS, htmx and the Material Symbols icon font are vendored into
