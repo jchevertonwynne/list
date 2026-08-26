@@ -119,18 +119,41 @@
     }
   }
 
+  // Set when a re-fetch had to be skipped because an edit form was open, so
+  // the skip can be made good later. Nothing else would ever make it good:
+  // this tab ignores the echo of its own save, so closing the form publishes
+  // an event that comes straight back and is discarded, and a missed event is
+  // never replayed by the server. Without remembering the skip, the list
+  // stays wrong until the page is reloaded by hand.
+  let itemsStale = false;
+
   // Re-fetch the whole item list. Used for any change that can move a row
   // rather than just alter one: a create, a tick (done items sort to the
   // bottom), or someone else's drag. The open-form guard is what stops a
   // colleague's tick from destroying an edit this tab has in progress; the
-  // list stays stale only until that edit is saved or cancelled.
+  // list stays stale only until that edit is saved or cancelled, which the
+  // itemsStale flag and the listener below are what actually deliver.
   function refetchItems() {
-    if (!collectionID || itemsHasOpenForm()) return;
+    if (!collectionID) return;
+    if (itemsHasOpenForm()) {
+      itemsStale = true;
+      return;
+    }
+    itemsStale = false;
     htmx.ajax("GET", "/collections/" + collectionID + "/items", {
       target: "#items",
       swap: "outerHTML",
     });
   }
+
+  // Every way an edit form can close — saving it, cancelling it — is an htmx
+  // swap of the row the form sits in, so the end of any swap is the moment to
+  // ask whether the form that blocked a re-fetch has gone. The re-fetch this
+  // triggers is itself a swap, but it clears the flag before issuing the
+  // request, so it does not re-enter.
+  document.body.addEventListener("htmx:afterSwap", () => {
+    if (itemsStale && !itemsHasOpenForm()) refetchItems();
+  });
 
   // Re-fetch everything this page shows. Used on (re)connect so a missed
   // event — one dropped as a slow consumer, or one that happened while the
